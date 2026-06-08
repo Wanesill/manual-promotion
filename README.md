@@ -14,27 +14,37 @@ API. Каждые 5 минут читает таблицу `manual_promotion` и
   по аккаунтам параллельно, по объявлениям внутри аккаунта — последовательно.
 - **Решающее правило** — чистая функция `compute_target_state` с 18 ранними
   выходами: статус объявления → бюджет/тариф → расписание → метрики
-  (показы / просмотры / контакты / CPV / CPC) → границы ставки → дрейф со
-  стороны Avito → cooldown 1 ч → почасовой snapshot.
+  (показы / просмотры / контакты / CPV / CPC) → границы ставки → drift
+  относительно последней записи в `manual_promotion_log` → cooldown 1 ч →
+  почасовой snapshot.
 - **Выполнение** — `set_manual_bid` / `remove_cpxpromo` через `AvitoService`
-  (singleton `aiohttp.ClientSession`, 429/500 ретраи), запись в
-  `manual_promotion_log` (раз в час + на смены состояния) и системные
-  заметки `manual_promotion_note` (по одной на событие, без дубликатов).
+  (singleton `aiohttp.ClientSession`, 429/5xx ретраи через
+  `x-ratelimit-retry-after`), запись в `manual_promotion_log` (раз в час +
+  на смены состояния) и системные заметки `manual_promotion_note` (по одной
+  на событие, без дубликатов).
 
 ## Ключевые архитектурные решения
 
 - **Один инстанс на процесс.** Шардирования нет.
 - **Не владеет схемой БД.** Родительский API создаёт/мигрирует таблицы; мы
   только читаем + редактируем whitelisted-поля (`log_message`,
-  `critical_*`, `disabled_bid`).
-- **Статистика метрик из БД.** Дневная дельта = `MAX − MIN` по таблице
-  `ad_detail_statistic` за сегодня. Avito API за метриками не дёргаем.
-- **Батч на 5000 объявлений.** Текущие ставки — одним вызовом
-  `getPromotionsByItemIds` на аккаунт (TTL кэша 5 мин в Redis). Границы
-  ставки (`get_bids`) — пер-объявление, кэш 1 ч.
-- **Rate limiter** in-memory sliding-window per `(account_id, endpoint)`:
-  `set_manual_bid` 20/мин, `get_bids`/`get_actual_rates` 20/мин,
-  `remove_cpxpromo` 300/мин.
+  `critical_*`, `disabled_bid`) и append-only-таблицы
+  `manual_promotion_log` / `manual_promotion_note`.
+- **Токены аккаунтов не обновляем.** `access_token` / `expires_in` пишет
+  родительский сервис; здесь только читаем. Если токен истёк —
+  `LOG_DISABLED_BY_TOKEN_EXPIRED`, цикл по аккаунту пропускаем.
+- **Статистика метрик из БД.** Каждая запись в `ad_detail_statistic` —
+  накопительный счётчик за сегодня (сбрасывается в 00:00). Берём последнюю
+  запись на ad за сегодня (`DISTINCT ON (ad_id) ... ORDER BY timestamp
+  DESC`). Avito API за метриками не дёргаем.
+- **Drift через лог.** «Что уже стоит на Avito» определяем по
+  `ctx.last_log.bid`. Snapshot `getPromotionsByItemIds` с Avito не
+  запрашиваем.
+- **Кэш границ ставок.** `get_bids` per-ad — `mp:bids:{ad_id}` TTL 1 ч в
+  Redis с in-process fallback (`cachetools.TTLCache`).
+- **Rate-лимитера нет.** На 429/5xx `AvitoService` сам ждёт по
+  `x-ratelimit-retry-after` и повторяет запрос. Внутри аккаунта вызовы
+  последовательные (`asyncio.gather` — только по аккаунтам).
 - **State store в Redis**: `mp:last_set:{ad_id}` (TTL ~25 ч) — для часового
   cooldown; `mp:last_event:{promotion_id}` (без TTL) — для дедупликации
   системных заметок. Namespace `mp:` — фиксированный (сервис рассчитан на
@@ -70,7 +80,7 @@ APP_CONFIG=config.yml poetry run python -m app
 | ---------- | ------------------------------------------------------------------------------------------- |
 | `database` | DSN PostgreSQL (`postgresql+asyncpg://…`), пул соединений                                    |
 | `redis`    | DSN Redis (`redis://…/0`)                                                                   |
-| `logging`  | Уровень, дублирование в stderr (файлы — всегда, в `logs/YYYY-MM-DD.log`, ретенция 30 дней)  |
+| `logging`  | Уровень, дублирование в stderr (файлы — всегда, в `logs/YYYY-MM-DD.log`)                    |
 
 Параметры цикла (`CYCLE_INTERVAL_S=300`, `MAX_CYCLE_TIMEOUT_MULTIPLIER=3`)
 зашиты константами в [`app/dispatcher/process_dispatcher.py`](./app/dispatcher/process_dispatcher.py)
@@ -89,17 +99,16 @@ app/
 ├── database/
 │   ├── database.py              # DAL: load_active_promotions, load_today_stats,
 │   │                            #   insert_log, insert_system_note, upsert_critical,
-│   │                            #   bulk_update_log_message, update_account_token
+│   │                            #   bulk_update_log_message
 │   └── models/                  # SQLAlchemy 2.0 — read-only mirror схемы родителя
 ├── external_services/
 │   └── avito_service.py         # singleton ClientSession, retry, AccountForbiddenError
 ├── infra/
-│   ├── rate_limiter.py          # AccountRateLimiter — sliding window per (acc, ep)
-│   ├── redis_cache.py           # AvitoCache — Redis + cachetools fallback
+│   ├── redis_cache.py           # AvitoCache (mp:bids:*) — Redis + cachetools fallback
 │   └── state_store.py           # StateStore — last_set_at / last_event
 └── dispatcher/
     ├── process_dispatcher.py    # cycle() + run_dispatcher_loop
-    ├── account_session.py       # обёртка над AvitoService с rate-limit acquire
+    ├── account_session.py       # обёртка над AvitoService (проверка токена + bids-кэш)
     ├── critical_bids.py         # parse_critical_bids, pick_compare_percent
     ├── decision_engine.py       # compute_target_state — чистая функция
     └── apply_decision.py        # единственный мутирующий слой
@@ -109,11 +118,13 @@ app/
 
 - **`manual_promotion_log`** — запись `(bid, compare_percent, timestamp)`
   раз в час + на изменения. UNIQUE на `(promotion_id, timestamp)` даёт
-  идемпотентность.
+  идемпотентность. Этот же лог — источник «что мы последний раз отправили
+  в Avito» для drift-детекта.
 - **`manual_promotion_note(kind="system")`** — заметка пишется один раз на
   событие; новая запись только если канонический `log_message` сменился
-  по сравнению с кэшем в Redis.
-- **Файловые логи** — `logs/YYYY-MM-DD.log`, ротация 30 дней.
+  по сравнению с кэшем в Redis (`mp:last_event:*`).
+- **Файловые логи** — `logs/YYYY-MM-DD.log`, ротации по retention нет —
+  оставлено на внешний logrotate / systemd.
 
 ## Лицензия
 

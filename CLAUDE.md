@@ -69,12 +69,13 @@ hard timeout of `CYCLE_INTERVAL_S * MAX_CYCLE_TIMEOUT_MULTIPLIER`
 as a single instance, no per-deployment tuning is expected. One cycle: load
 active promotions (one SQL with the necessary JOINs), group by `account`, fan
 out per-account in `asyncio.gather`. Inside an account: one `load_today_stats`
-(from `ad_detail_statistic`), then sequentially per ad:
-`compute_target_state` → if it needs bid bounds, `fetch_bids` + recompute →
-`apply_decision`. Per-account-sequential preserves the rate-limit
-(`set_manual_bid` 20/min, `remove_cpxpromo` 300/min, `get_bids` 20/min per
-account). Drift детектится по `ctx.last_log.bid` — текущее состояние на
-стороне Avito с API не запрашиваем.
+(from `ad_detail_statistic`, latest row per ad of today), then sequentially
+per ad: `compute_target_state` → if it needs bid bounds, `fetch_bids` +
+recompute → `apply_decision`. Внутри аккаунта вызовы Avito идут
+последовательно (нет проактивного rate-лимитера; на 429 `AvitoService` сам
+ждёт по `x-ratelimit-retry-after`). Drift детектится по
+`ctx.last_log.bid` — текущее состояние на стороне Avito с API не
+запрашиваем.
 
 ## Key DAL methods (`app/database/database.py`)
 
@@ -193,12 +194,12 @@ material** carried over from a larger monolith. Files there import packages
 `app.auth`, `app.core.responses`, `app.bidder`, `fluentogram`) that don't
 exist in this repo — don't symlink or copy them blindly.
 
-- `docs/promotion/` — source-monolith logic. Useful for: token-refresh
-  pattern (1-hour expiry threshold), the `@retry_with_backoff` decorator,
-  exact request bodies for `set_manual_bid` / `remove_cpxpromo`,
-  `AccountForbiddenError` semantics. Don't copy the monolith's
-  Google-Sheets / `PromotionQueue` machinery — this service doesn't need
-  it.
+- `docs/promotion/` — source-monolith logic. Useful for: the
+  `@retry_with_backoff` decorator, exact request bodies for
+  `set_manual_bid` / `remove_cpxpromo`, `AccountForbiddenError` semantics.
+  **Не копируй** token-refresh pattern из монолита: здесь токены пишет
+  родительский сервис, дёргать `/token` запрещено. Также не нужны
+  Google-Sheets / `PromotionQueue` куски.
 - `docs/api/manual_promotion/` — the parent FastAPI module. Read it before
   changing response shapes or `log_message` formats — schemas there are
   the contract. The custom `PlainSerializer` annotations (`MoneyRub`,
