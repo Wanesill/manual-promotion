@@ -17,7 +17,6 @@ from app.log_messages import (
 if TYPE_CHECKING:
     from app.database.database import Database, PromotionContext
     from app.dispatcher.account_session import AccountSession
-    from app.infra.state_store import StateStore
 
 __all__ = ["apply_decision"]
 
@@ -27,7 +26,6 @@ async def apply_decision(
     ctx: PromotionContext,
     session: AccountSession,
     database: Database,
-    state: StateStore,
     now: datetime,
 ) -> str | None:
     """Применяет Decision и возвращает финальный log_message.
@@ -57,7 +55,6 @@ async def apply_decision(
             await session.invalidate_caches_for_ad(ctx.ad.ad_id)
             return log_message
         if result:
-            await state.mark_set(ctx.ad.ad_id, now)
             await session.invalidate_caches_for_ad(ctx.ad.ad_id)
         elif result is None:
             # Avito отверг ставку — границы устарели, сбросим bids-кэш
@@ -73,7 +70,9 @@ async def apply_decision(
             log_message = LOG_DISABLED_BY_AUTH_FAILED
             return log_message
 
-    # 3. запись лога (после успешного сетевого вызова или просто snapshot)
+    # 3. запись лога (после успешного сетевого вызова или просто snapshot).
+    # Эта запись — единственный источник для cooldown (1 ч) и для drift-
+    # детекта в decision_engine: см. ctx.last_log в следующем цикле.
     if decision.write_log and decision.log_bid is not None:
         # Если SET_BID не удался — лог не пишем (фактическая ставка
         # не изменилась). Логируем только подтверждённые состояния.
@@ -94,7 +93,9 @@ async def apply_decision(
                     decision.log_bid,
                 )
 
-    # 4. системная заметка (один раз на событие)
+    # 4. системная заметка (один раз на событие). Дедупликация —
+    # `_system_note_text` уже сравнил с `promotion.log_message`; здесь
+    # просто пишем без апдейта какого-либо внешнего state.
     if decision.write_system_note is not None and log_message is not None:
         need_write, text = decision.write_system_note
         if need_write:
@@ -110,6 +111,5 @@ async def apply_decision(
                     ctx.promotion.id,
                     text,
                 )
-            await state.set_last_event(ctx.promotion.id, log_message)
 
     return log_message

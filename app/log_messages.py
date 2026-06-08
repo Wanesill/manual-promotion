@@ -25,7 +25,6 @@ __all__ = [
     "LOG_DISABLED_BY_TIME",
     "LOG_DISABLED_BY_TOKEN_EXPIRED",
     "LOG_DISABLED_BY_VIEWS",
-    "LOG_LIMIT_EXCEEDED",
     "LOG_NOT_CONFIGURED",
     "LOG_PROMOTION_DISABLED",
     "LOG_PROMOTION_UNAVAILABLE",
@@ -56,7 +55,6 @@ LOG_BID_ABOVE_MAX_PREFIX: Final[str] = (
     "Ставка должна быть меньше максимального значения"
 )
 LOG_DISABLED_BY_TARIFF: Final[str] = "Тариф закончился"
-LOG_LIMIT_EXCEEDED: Final[str] = "Превышен лимит по подключенным объявлениям"
 LOG_DISABLED_BY_ACCOUNT_DELETED: Final[str] = "Аккаунт удален"
 LOG_DISABLED_BY_TOKEN_EXPIRED: Final[str] = "Токен аккаунта истек"
 LOG_DISABLED_BY_AUTH_FAILED: Final[str] = "Не удалось авторизовать аккаунт"

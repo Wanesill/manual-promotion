@@ -14,7 +14,7 @@ from .decision_engine import (
     compute_target_state,
     recompute_with_bids,
 )
-from .process_dispatcher import cycle, run_dispatcher_loop
+from .process_dispatcher import run_dispatcher
 
 __all__ = [
     "AccountSession",
@@ -25,9 +25,8 @@ __all__ = [
     "DecisionInput",
     "apply_decision",
     "compute_target_state",
-    "cycle",
     "parse_critical_bids",
     "pick_compare_percent",
     "recompute_with_bids",
-    "run_dispatcher_loop",
+    "run_dispatcher",
 ]

@@ -16,9 +16,15 @@ Avito's state in sync with the rows the parent service writes.
 
 Critical constraints baked into the design:
 
-- **`set_manual_bid` runs at most once per hour per ad**, but
-  disable-conditions are re-evaluated every 5 minutes (so a budget breach
-  takes effect quickly, but the bid itself isn't re-pushed without reason).
+- **`set_manual_bid` runs at most once per hour per ad** (cooldown
+  считается по `ctx.last_log.timestamp`). Лимит проверяется per-account
+  каждый цикл, но для крупного аккаунта цикл сам может длиться часами
+  (см. ниже), и стейл-чек по бюджету мы лечим refresh'ом stats внутри
+  итерации каждые 5 мин.
+- **Per-account workers**, не один глобальный цикл. Supervisor каждые
+  5 мин перечитывает список активных аккаунтов и спавнит/останавливает
+  воркеры. Один воркер = один аккаунт, его итерация может занять
+  4+ ч (5000 ad × 20/мин get_bids), хард-таймаута на итерацию нет.
 - **Single instance** — no sharding, no leader election.
 - **Schema is owned by the parent service** — we only read from it and write
   to whitelisted columns (`log_message`, `critical_min_bid`,
@@ -50,10 +56,9 @@ app/
 │                                  AccountForbiddenError, 429/5xx retry via
 │                                  `x-ratelimit-retry-after`
 ├── infra/
-│   ├── redis_cache.py           AvitoCache — Redis + cachetools fallback
-│   └── state_store.py           StateStore — last_set_at, last_event
+│   └── redis_cache.py           AvitoCache — Redis + cachetools fallback
 └── dispatcher/
-    ├── process_dispatcher.py    cycle() + run_dispatcher_loop (fixed cycle_interval windows)
+    ├── process_dispatcher.py    run_dispatcher: supervisor + per-account workers
     ├── account_session.py       wraps AvitoService (token check + bids cache)
     ├── critical_bids.py         parse_critical_bids, pick_compare_percent
     ├── decision_engine.py       compute_target_state — pure function, 18 stages
@@ -62,27 +67,30 @@ app/
 
 ## Cycle in one paragraph
 
-`run_dispatcher_loop` repeats `cycle()` every `CYCLE_INTERVAL_S` seconds
-(constant in `app/dispatcher/process_dispatcher.py`, default 300) with a
-hard timeout of `CYCLE_INTERVAL_S * MAX_CYCLE_TIMEOUT_MULTIPLIER`
-(default ×3). Both knobs are intentionally hard-coded — this service runs
-as a single instance, no per-deployment tuning is expected. One cycle: load
-active promotions (one SQL with the necessary JOINs), group by `account`, fan
-out per-account in `asyncio.gather`. Inside an account: one `load_today_stats`
-(from `ad_detail_statistic`, latest row per ad of today), then sequentially
-per ad: `compute_target_state` → if it needs bid bounds, `fetch_bids` +
-recompute → `apply_decision`. Внутри аккаунта вызовы Avito идут
-последовательно (нет проактивного rate-лимитера; на 429 `AvitoService` сам
-ждёт по `x-ratelimit-retry-after`). Drift детектится по
-`ctx.last_log.bid` — текущее состояние на стороне Avito с API не
-запрашиваем.
+`run_dispatcher` запускает supervisor-таск: каждые `CYCLE_INTERVAL_S`
+(default 300) он вызывает `load_active_account_ids`, спавнит
+`_account_loop(account_id)` для новых, выставляет per-worker `stop` для
+отвалившихся (воркер выходит между объявлениями — сетевой вызов не рвём),
+и подбирает упавшие задачи (рестарт = на следующем тике supervisor'а).
+Один воркер аккаунта = бесконечный цикл с целевым интервалом
+`CYCLE_INTERVAL_S`. Внутри одной итерации: `load_account_promotions` →
+если нет активных promotion'ов, воркер выходит; иначе `ensure_token`,
+`load_today_stats`, затем sequentially per ad: `compute_target_state` →
+если нужны bid bounds, `fetch_bids` + recompute → `apply_decision`.
+Внутри прохода каждые `STATS_REFRESH_INTERVAL_S` (5 мин) дозагружаем
+`stats` + `now` — иначе на 4-часовом цикле бюджет/расписание сильно
+устарели бы. Drift детектится по `ctx.last_log.bid`. Проактивного
+rate-лимитера нет; на 429 `AvitoService` сам ждёт по
+`x-ratelimit-retry-after`.
 
 ## Key DAL methods (`app/database/database.py`)
 
-- `load_active_promotions()` — the one SELECT with JOIN on
-  `ManualPromotion`/`Account`/`Ad`/`Profile`, filters `status IS TRUE`,
-  `deleted_at IS NULL`. Returns a `Snapshot` grouped by account. No
-  profile filtering — this is a single-instance service.
+- `load_active_account_ids()` — `DISTINCT ON` `ManualPromotion.account_id`
+  для активных строк. Используется supervisor'ом.
+- `load_account_promotions(account_id)` — снимок всех активных promotion'ов
+  одного аккаунта (с join'ом на `Account`/`Ad`/`Profile` и последним логом
+  на promotion). Возвращает None если активных нет — воркер аккаунта
+  выходит, supervisor подберёт.
 - `load_today_stats(account_id, today=None)` — `DISTINCT ON (ad_id)` over
   `ad_detail_statistic` rows since 00:00, ordered by `ad_id, timestamp DESC`,
   joined with `Ad`. Возвращает накопленные сегодня
@@ -111,12 +119,18 @@ returns an `Action` (NOOP, FETCH_BIDS, SET_BID, REMOVE) plus the bid/limit
 to send, the canonical `log_message`, and flags for `write_log` /
 `write_system_note` / `update_critical`. Stages are ordered with early
 exit; the precise order is documented in the docstring of
-`decision_engine.py` (18 stages, повторены в коде). Key rules:
+`decision_engine.py` (17 stages, повторены в коде). Key rules:
 
 - If `critical_*` fields on the row are NULL → return `FETCH_BIDS`. Caller
   fetches bid bounds via Avito API and re-runs `recompute_with_bids`.
-- Limit clamp: `limit_to_send = clamp(daily_budget, critical_min_limit,
-  critical_max_limit)` — always sent to Avito if `daily_budget` is set.
+- **`bid` обязателен.** Если за пределами `critical_min_bid` /
+  `critical_max_bid` — NOOP с `LOG_BID_BELOW_MIN` / `LOG_BID_ABOVE_MAX_PREFIX`.
+  Ставку **не зажимаем** — это сигнал оператору, что граница нарушена.
+- **`daily_budget` опционален.** Если `None` — `limitPenny` в `set_manual_bid`
+  не отправляем, бюджетные стадии (7) пропускаем. Если задан и вышел за
+  `critical_min_limit` / `critical_max_limit` — зажимаем до критического и
+  округляем до целого рубля (100 копеек): нижний предел вверх, верхний
+  вниз, чтобы остаться внутри границ.
 - `compare_percent` is picked by `pick_compare_percent(bid, manual.bids[])`
   — sort by `valuePenny`, find the segment `current.valuePenny <= bid <
   next.valuePenny`. Below min → `bids[0].compare`; above max →
@@ -163,27 +177,30 @@ token refresh is owned by the parent API.
 
 The batch `getPromotionsByItemIds` endpoint is **not** called either — drift
 ("did we already send this bid?") is detected against the last row in
-`manual_promotion_log` rather than against Avito's actual state. Trade-off: for
-ads with `daily_budget` set (which is every active row, per stage 2), this
-re-pushes `set_manual_bid` once per cooldown (1h) even when nothing changed.
-That's within rate limits.
+`manual_promotion_log` rather than against Avito's actual state. Trade-off: для
+объявлений с заданным `daily_budget` это означает повторный `set_manual_bid`
+раз в cooldown (1 ч), даже если ничего не поменялось — лимит туда мы не
+пишем и состояния не отслеживаем. Для объявлений без `daily_budget` drift
+триггерится только сменой `bid`. Всё в пределах rate-лимитов.
 
 Statistics (`ad_detail_statistic`) are **not** cached in Redis — they're
 read from PostgreSQL every cycle (cheap; the parent service maintains the
 table).
 
-## State store (`infra/state_store.py`)
+## Dispatcher state lives in PostgreSQL, not Redis
 
-| Key                            | TTL  | Purpose                                                       |
-| ------------------------------ | ---- | ------------------------------------------------------------- |
-| `mp:last_set:{ad_id}`          | ~25h | timestamp of last `set_manual_bid` — for hourly cooldown      |
-| `mp:last_event:{promotion_id}` | none | last canonical `log_message` — for system-note deduplication  |
+There is no Redis state store. Что было раньше в `mp:last_set:*` /
+`mp:last_event:*` теперь читается прямо из БД:
 
-Namespace `mp:` is fixed — single instance, no need for per-deployment
-scoping.
-
-Worst case after losing Redis: one redundant `set_manual_bid` per ad in the
-next cycle and one duplicated note per promotion. Acceptable.
+- **Cooldown 1 ч** — якорь это `ctx.last_log.timestamp` (последняя запись в
+  `manual_promotion_log`). Заметь: `manual_promotion_log` пишется и на
+  SET_BID, и на почасовой snapshot, поэтому cooldown может «съезжать»
+  вперёд на ~1 ч в худшем случае (drift сразу после hourly snapshot подождёт
+  ещё час). Принято осознанно — упрощение важнее.
+- **Дедупликация system-заметок** — сравниваем `decision.log_message` с
+  `ctx.promotion.log_message`. Если состояние не изменилось — заметку не
+  пишем. `promotion.log_message` обновляется в конце цикла через
+  `bulk_update_log_message`, так что следующий цикл видит свежее значение.
 
 ## Coding conventions
 

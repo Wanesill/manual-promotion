@@ -32,7 +32,7 @@ from app.log_messages import NOTE_KIND_SYSTEM
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-__all__ = ["CriticalUpdate", "Database", "PromotionContext", "Snapshot"]
+__all__ = ["CriticalUpdate", "Database", "PromotionContext"]
 
 
 @dataclass(frozen=True)
@@ -48,21 +48,13 @@ class CriticalUpdate:
 
 @dataclass
 class PromotionContext:
-    """Связка ManualPromotion + Account + Ad + Profile + last log + порядок."""
+    """Связка ManualPromotion + Account + Ad + Profile + last log."""
 
     promotion: ManualPromotion
     account: Account
     ad: Ad
     profile: Profile | None
     last_log: ManualPromotionLog | None
-    profile_rank: int  # 1-based порядок promotion'а в профиле по id ASC
-
-
-@dataclass
-class Snapshot:
-    """Свежий снимок всех активных promotion'ов, сгруппированный по аккаунту."""
-
-    by_account: dict[int, tuple[Account, list[PromotionContext]]]
 
 
 class Database:
@@ -73,42 +65,62 @@ class Database:
 
     # ---------- чтение ----------
 
-    async def load_active_promotions(self) -> Snapshot:
-        """Один SELECT JOIN + один SELECT для last log на promotion."""
+    async def load_active_account_ids(self) -> set[int]:
+        """ID аккаунтов, у которых есть хоть один активный ManualPromotion.
+
+        Возвращается supervisor'у каждые ~5 мин для синхронизации списка
+        per-account воркеров (добавить новых, отменить отвалившихся).
+        """
         stmt = (
-            select(ManualPromotion, Account, Ad, Profile)
-            .join(Account, Account.id == ManualPromotion.account_id)
-            .join(Ad, Ad.id == ManualPromotion.ad_id)
-            .outerjoin(Profile, Profile.id == Account.profile_id)
+            select(ManualPromotion.account_id)
             .where(ManualPromotion.status.is_(True))
             .where(ManualPromotion.deleted_at.is_(None))
-            .order_by(Account.profile_id, ManualPromotion.id)
+            .distinct()
         )
-
         async with self._sessionmaker() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return set(rows)
+
+    async def load_account_promotions(
+        self, account_id: int
+    ) -> tuple[Account, list[PromotionContext]] | None:
+        """Снимок всех активных promotion'ов одного аккаунта.
+
+        Возвращает (Account, list[PromotionContext]) либо None, если у
+        аккаунта не осталось активных строк (тогда воркер выходит — supervisor
+        снова не заведёт его, пока в БД не появится активный promotion).
+        """
+        async with self._sessionmaker() as session:
+            stmt = (
+                select(ManualPromotion, Account, Ad, Profile)
+                .join(Account, Account.id == ManualPromotion.account_id)
+                .join(Ad, Ad.id == ManualPromotion.ad_id)
+                .outerjoin(Profile, Profile.id == Account.profile_id)
+                .where(ManualPromotion.account_id == account_id)
+                .where(ManualPromotion.status.is_(True))
+                .where(ManualPromotion.deleted_at.is_(None))
+                .order_by(ManualPromotion.id)
+            )
             rows = (await session.execute(stmt)).all()
             if not rows:
-                return Snapshot(by_account={})
+                return None
 
+            account = rows[0][1]
             promotion_ids = [row[0].id for row in rows]
             last_logs = await self._load_last_logs(session, promotion_ids)
 
-        by_account: dict[int, tuple[Account, list[PromotionContext]]] = {}
-        profile_counter: dict[int, int] = {}
-        for promotion, account, ad, profile in rows:
-            rank = profile_counter.get(account.profile_id, 0) + 1
-            profile_counter[account.profile_id] = rank
-            ctx = PromotionContext(
-                promotion=promotion,
-                account=account,
-                ad=ad,
-                profile=profile,
-                last_log=last_logs.get(promotion.id),
-                profile_rank=rank,
+        contexts: list[PromotionContext] = []
+        for promotion, account_row, ad, profile in rows:
+            contexts.append(
+                PromotionContext(
+                    promotion=promotion,
+                    account=account_row,
+                    ad=ad,
+                    profile=profile,
+                    last_log=last_logs.get(promotion.id),
+                )
             )
-            bucket = by_account.setdefault(account.id, (account, []))
-            bucket[1].append(ctx)
-        return Snapshot(by_account=by_account)
+        return account, contexts
 
     @staticmethod
     async def _load_last_logs(

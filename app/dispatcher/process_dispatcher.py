@@ -1,9 +1,31 @@
-"""Главный цикл диспетчера: 5-минутный snapshot → per-account обработка."""
+"""Per-account workers + supervisor.
+
+`run_dispatcher` запускает один supervisor-таск:
+
+- supervisor каждые `CYCLE_INTERVAL_S` (5 мин) перечитывает список активных
+  аккаунтов из БД, спавнит воркеры для новых, сигналит остановку для
+  отвалившихся (cancel'а нет — воркер выходит между объявлениями, не рвёт
+  сетевой вызов), и подбирает упавшие задачи.
+- account_loop(account_id) — независимый бесконечный цикл одного аккаунта.
+  На каждой итерации:
+    1. load_account_promotions → если уже пусто, выходим (supervisor поймёт);
+    2. ensure_token; снимок stats; обрабатываем объявления последовательно;
+    3. внутри прохода каждые `STATS_REFRESH_INTERVAL_S` (5 мин) дозагружаем
+       свежие stats + `now`, потому что на 5000 объявлений с лимитом
+       20/мин на get_bids цикл может длиться часами и бюджет успеет
+       протечь;
+    4. между объявлениями проверяем `stop_event` — это точка корректного
+       выхода и для shutdown'а, и для cancel'а отвалившегося аккаунта.
+
+`MAX_CYCLE_TIMEOUT_MULTIPLIER` нет — цикл аккаунта может занять часы, и
+это нормально (5000 ad * 20/мин get_bids ≈ 4 ч).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
 
@@ -31,108 +53,197 @@ if TYPE_CHECKING:
     from app.database.database import (
         Database,
         PromotionContext,
-        Snapshot,
     )
-    from app.database.models import Account
     from app.infra.redis_cache import AvitoCache
-    from app.infra.state_store import StateStore
 
 __all__ = [
     "CYCLE_INTERVAL_S",
-    "MAX_CYCLE_TIMEOUT_MULTIPLIER",
-    "cycle",
-    "run_dispatcher_loop",
+    "STATS_REFRESH_INTERVAL_S",
+    "run_dispatcher",
 ]
 
 CYCLE_INTERVAL_S: Final[int] = 300
-"""Интервал между стартами циклов диспетчера, секунды."""
+"""Целевой интервал между итерациями account_loop и supervisor refresh-тиками."""
 
-MAX_CYCLE_TIMEOUT_MULTIPLIER: Final[int] = 3
-"""Принудительный cancel если цикл идёт дольше CYCLE_INTERVAL_S × этот множитель."""
+STATS_REFRESH_INTERVAL_S: Final[int] = 300
+"""Перечитывать stats + now внутри одной итерации account_loop не реже этого."""
 
 
-async def cycle(
+@dataclass
+class _Worker:
+    task: asyncio.Task
+    stop: asyncio.Event
+
+
+async def run_dispatcher(
     database: Database,
     cache: AvitoCache,
-    state: StateStore,
-    cycle_number: int,
+    stop_event: asyncio.Event,
 ) -> None:
-    """Один полный цикл: загружает snapshot и обрабатывает по аккаунтам."""
-    now = datetime.now()
-    snapshot: Snapshot = await database.load_active_promotions()
-    if not snapshot.by_account:
-        logger.info("Цикл {} — активных promotion'ов нет", cycle_number)
+    """Точка входа: supervisor с воркерами на аккаунт."""
+    workers: dict[int, _Worker] = {}
+    try:
+        while not stop_event.is_set():
+            tick_start = time.monotonic()
+            await _supervisor_tick(database, cache, stop_event, workers)
+            elapsed = time.monotonic() - tick_start
+            wait_for = max(0.0, CYCLE_INTERVAL_S - elapsed)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=wait_for)
+                break
+            except TimeoutError:
+                continue
+    finally:
+        for worker in workers.values():
+            worker.stop.set()
+        if workers:
+            await asyncio.gather(
+                *(w.task for w in workers.values()),
+                return_exceptions=True,
+            )
+
+
+async def _supervisor_tick(
+    database: Database,
+    cache: AvitoCache,
+    stop_event: asyncio.Event,
+    workers: dict[int, _Worker],
+) -> None:
+    """Один supervisor-тик: обновить список активных аккаунтов."""
+    try:
+        active_ids = await database.load_active_account_ids()
+    except Exception:
+        logger.exception("supervisor: load_active_account_ids упал")
         return
 
-    total_ads = sum(len(c) for _, c in snapshot.by_account.values())
+    # 1. подобрать завершённые/упавшие воркеры
+    for acc_id, worker in list(workers.items()):
+        if not worker.task.done():
+            continue
+        if exc := worker.task.exception():
+            logger.error("account {} воркер упал: {}", acc_id, exc)
+        workers.pop(acc_id, None)
+
+    # 2. остановить воркеры неактивных аккаунтов (graceful, между ad'ами)
+    for acc_id, worker in workers.items():
+        if acc_id not in active_ids and not worker.stop.is_set():
+            logger.info("account {} больше не активен — останавливаем воркер", acc_id)
+            worker.stop.set()
+
+    # 3. поднять воркеры для новых активных аккаунтов
+    for acc_id in active_ids - workers.keys():
+        worker_stop = asyncio.Event()
+        task = asyncio.create_task(
+            _account_loop(acc_id, database, cache, stop_event, worker_stop),
+            name=f"account-{acc_id}",
+        )
+        workers[acc_id] = _Worker(task=task, stop=worker_stop)
+        logger.info("account {} запущен воркер", acc_id)
+
     logger.info(
-        "Цикл {} старт: аккаунтов {}, объявлений {}",
-        cycle_number,
-        len(snapshot.by_account),
-        total_ads,
+        "supervisor: активных аккаунтов {}, живых воркеров {}",
+        len(active_ids),
+        sum(1 for w in workers.values() if not w.task.done()),
     )
 
-    await asyncio.gather(
-        *(
-            _process_account(
-                account=account,
-                contexts=contexts,
-                now=now,
+
+async def _account_loop(
+    account_id: int,
+    database: Database,
+    cache: AvitoCache,
+    stop_event: asyncio.Event,
+    worker_stop: asyncio.Event,
+) -> None:
+    """Бесконечный цикл одного аккаунта."""
+    iteration = 0
+    while not stop_event.is_set() and not worker_stop.is_set():
+        iteration += 1
+        iter_start = time.monotonic()
+        try:
+            done = await _account_cycle(
+                account_id=account_id,
                 database=database,
                 cache=cache,
-                state=state,
+                stop_event=stop_event,
+                worker_stop=worker_stop,
             )
-            for account, contexts in snapshot.by_account.values()
-        ),
-        return_exceptions=False,
-    )
+        except Exception:
+            logger.exception("account {} итерация {} упала", account_id, iteration)
+            done = False
+
+        elapsed = time.monotonic() - iter_start
+        logger.info(
+            "account {} итерация {} завершена за {:.1f}с (active={})",
+            account_id,
+            iteration,
+            elapsed,
+            not done,
+        )
+        if done:
+            return
+        wait_for = max(0.0, CYCLE_INTERVAL_S - elapsed)
+        if not await _sleep_or_stop(wait_for, stop_event, worker_stop):
+            return
 
 
-async def _process_account(
-    account: Account,
-    contexts: list[PromotionContext],
-    now: datetime,
+async def _account_cycle(
+    account_id: int,
     database: Database,
     cache: AvitoCache,
-    state: StateStore,
-) -> None:
-    """Обрабатывает все promotion'ы одного аккаунта последовательно."""
+    stop_event: asyncio.Event,
+    worker_stop: asyncio.Event,
+) -> bool:
+    """Одна итерация цикла. Возвращает True, если воркер должен завершиться.
+
+    Завершение происходит когда у аккаунта не осталось активных promotion'ов
+    (load_account_promotions вернул None) — supervisor подберёт.
+    """
+    snapshot = await database.load_account_promotions(account_id)
+    if snapshot is None:
+        return True
+    account, contexts = snapshot
+
     if account.status == "deleted":
-        await _bulk_set_log(
-            database,
-            contexts,
-            LOG_DISABLED_BY_ACCOUNT_DELETED,
-            state,
-        )
-        return
+        await _bulk_set_log(database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED)
+        return False
 
     session = AccountSession(account=account, cache=cache)
     try:
         await session.ensure_token()
     except AccountTokenError as err:
-        await _bulk_set_log(database, contexts, err.log_message, state)
-        return
+        await _bulk_set_log(database, contexts, err.log_message)
+        return False
 
     stats = await session.fetch_stats_today(database)
+    stats_at = time.monotonic()
+    now = datetime.now()
 
-    updates: list[tuple[int, str | None]] = []
     for ctx in contexts:
+        if stop_event.is_set() or worker_stop.is_set():
+            return False
+        if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
+            try:
+                stats = await session.fetch_stats_today(database)
+            except Exception:
+                logger.exception("account {} refresh stats упал", account_id)
+            else:
+                stats_at = time.monotonic()
+                now = datetime.now()
         try:
             log_message = await _decide_and_apply(
                 ctx=ctx,
                 now=now,
                 session=session,
                 database=database,
-                state=state,
                 stats_snapshot=stats.get(ctx.ad.ad_id),
             )
         except Exception:
             logger.exception("Сбой обработки promotion={}", ctx.promotion.id)
             continue
         if log_message is not None and log_message != ctx.promotion.log_message:
-            updates.append((ctx.promotion.id, log_message))
-
-    await database.bulk_update_log_message(updates)
+            await database.bulk_update_log_message([(ctx.promotion.id, log_message)])
+            ctx.promotion.log_message = log_message
+    return False
 
 
 async def _decide_and_apply(
@@ -140,20 +251,14 @@ async def _decide_and_apply(
     now: datetime,
     session: AccountSession,
     database: Database,
-    state: StateStore,
     stats_snapshot: dict | None,
 ) -> str | None:
     """Один decide → (опц. fetch_bids → recompute) → apply."""
-    last_set_at = await state.get_last_set_at(ctx.ad.ad_id)
-    cached_event = await state.get_last_event(ctx.promotion.id)
-
     base_input = DecisionInput(
         ctx=ctx,
         now=now,
         stats_snapshot=stats_snapshot,
         bids_info=None,
-        last_set_at=last_set_at,
-        cached_event=cached_event,
     )
     decision: Decision = compute_target_state(base_input)
 
@@ -173,7 +278,6 @@ async def _decide_and_apply(
         ctx=ctx,
         session=session,
         database=database,
-        state=state,
         now=now,
     )
 
@@ -182,51 +286,41 @@ async def _bulk_set_log(
     database: Database,
     contexts: list[PromotionContext],
     log_message: str,
-    state: StateStore,
 ) -> None:
     updates: list[tuple[int, str | None]] = []
     for ctx in contexts:
         if ctx.promotion.log_message != log_message:
             updates.append((ctx.promotion.id, log_message))
-            await state.set_last_event(ctx.promotion.id, log_message)
     await database.bulk_update_log_message(updates)
 
 
-async def run_dispatcher_loop(
-    database: Database,
-    cache: AvitoCache,
-    state: StateStore,
+async def _sleep_or_stop(
+    seconds: float,
     stop_event: asyncio.Event,
-) -> None:
-    """Бесконечный loop с фиксированными окнами CYCLE_INTERVAL_S секунд."""
-    cycle_number = 0
-    max_timeout = CYCLE_INTERVAL_S * MAX_CYCLE_TIMEOUT_MULTIPLIER
-    while not stop_event.is_set():
-        cycle_number += 1
-        cycle_start = time.monotonic()
-        try:
-            await asyncio.wait_for(
-                cycle(
-                    database=database,
-                    cache=cache,
-                    state=state,
-                    cycle_number=cycle_number,
-                ),
-                timeout=max_timeout,
-            )
-        except TimeoutError:
-            logger.error(
-                "Цикл {} превысил таймаут {}с — отменён",
-                cycle_number,
-                max_timeout,
-            )
-        except Exception:
-            logger.exception("Цикл {} упал", cycle_number)
-        elapsed = time.monotonic() - cycle_start
-        logger.info("Цикл {} завершён за {:.1f}с", cycle_number, elapsed)
-        wait_for = max(0.0, CYCLE_INTERVAL_S - elapsed)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=wait_for)
-            return
-        except TimeoutError:
-            continue
+    worker_stop: asyncio.Event,
+) -> bool:
+    """Спит, возвращая False, если за это время взвели любой из stop-флагов."""
+    if seconds <= 0:
+        return not (stop_event.is_set() or worker_stop.is_set())
+    waiter = asyncio.create_task(_wait_either(stop_event, worker_stop))
+    try:
+        await asyncio.wait_for(waiter, timeout=seconds)
+        return False
+    except TimeoutError:
+        waiter.cancel()
+        return True
+
+
+async def _wait_either(a: asyncio.Event, b: asyncio.Event) -> None:
+    """Ждёт, пока взведут любое из двух событий."""
+    a_task = asyncio.create_task(a.wait())
+    b_task = asyncio.create_task(b.wait())
+    try:
+        await asyncio.wait(
+            {a_task, b_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in (a_task, b_task):
+            if not t.done():
+                t.cancel()

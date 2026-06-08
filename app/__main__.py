@@ -24,9 +24,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.database.database import Database
-from app.dispatcher.process_dispatcher import run_dispatcher_loop
+from app.dispatcher.process_dispatcher import run_dispatcher
 from app.external_services import AvitoService
-from app.infra import AvitoCache, StateStore
+from app.infra import AvitoCache
 from app.settings import (
     DatabaseConfig,
     LoggingConfig,
@@ -111,7 +111,6 @@ async def main() -> None:
 
     database = Database(sessionmaker=sessionmaker)
     cache = AvitoCache(redis=redis)
-    state = StateStore(redis=redis)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -120,10 +119,9 @@ async def main() -> None:
             loop.add_signal_handler(sig, stop_event.set)
 
     dispatcher_task = asyncio.create_task(
-        run_dispatcher_loop(
+        run_dispatcher(
             database=database,
             cache=cache,
-            state=state,
             stop_event=stop_event,
         )
     )

@@ -5,19 +5,24 @@ Caller (apply_decision) выполняет сетевые вызовы и зап
 
 Stages (порядок ранних выходов, повторён в коде compute_target_state):
 1. ad.status != active                    → NOOP   LOG_USER_DELETED
-2. promotion.bid/daily_budget IS NULL     → NOOP   LOG_NOT_CONFIGURED
+2. promotion.bid IS NULL                  → NOOP   LOG_NOT_CONFIGURED
 3. profile / limit / end_date             → NOOP   LOG_DISABLED_BY_TARIFF
-4. profile_rank > manual_promotion_limit  → NOOP   LOG_LIMIT_EXCEEDED
-5. critical_* в БД отсутствуют            → FETCH_BIDS
-6. parse_critical_bids -> None            → NOOP   LOG_PROMOTION_UNAVAILABLE
-7. !in_work_schedule                      → REMOVE LOG_DISABLED_BY_TIME
-8. spending >= daily_budget               → REMOVE LOG_DISABLED_BY_BUDGET
-9-13. метрики                             → REMOVE LOG_DISABLED_BY_*
-14. bid < critical_min_bid                → NOOP   LOG_BID_BELOW_MIN
-15. bid > critical_max_bid                → NOOP   LOG_BID_ABOVE_MAX(...)
-16. drift && cooldown_ok                  → SET_BID LOG_SUCCESS
-17. drift && !cooldown_ok                 → NOOP
-18. !drift && hourly_log_due              → NOOP write_log=True
+4. critical_* в БД отсутствуют            → FETCH_BIDS
+5. parse_critical_bids -> None            → NOOP   LOG_PROMOTION_UNAVAILABLE
+6. !in_work_schedule                      → REMOVE LOG_DISABLED_BY_TIME
+7. spending >= daily_budget (если задан)  → REMOVE LOG_DISABLED_BY_BUDGET
+8-12. метрики                             → REMOVE LOG_DISABLED_BY_*
+13. bid < critical_min_bid                → NOOP   LOG_BID_BELOW_MIN
+14. bid > critical_max_bid                → NOOP   LOG_BID_ABOVE_MAX(...)
+15. drift && cooldown_ok                  → SET_BID LOG_SUCCESS
+16. drift && !cooldown_ok                 → NOOP
+17. !drift && hourly_log_due              → NOOP write_log=True
+
+`bid` обязателен; ставку за пределами critical_min_bid / critical_max_bid
+не зажимаем — возвращаем NOOP с ошибочным log_message.
+`daily_budget` опционален: если None → limitPenny в Avito не отправляем,
+бюджет не проверяем. Если задан и вышел за critical_min_limit /
+critical_max_limit — зажимаем до критического, округляя до рубля.
 
 При write_log=True И bids_info is None → FETCH_BIDS (нужны bids
 для compare_percent). После recompute_with_bids решение финализируется.
@@ -48,7 +53,6 @@ from app.log_messages import (
     LOG_DISABLED_BY_TARIFF,
     LOG_DISABLED_BY_TIME,
     LOG_DISABLED_BY_VIEWS,
-    LOG_LIMIT_EXCEEDED,
     LOG_NOT_CONFIGURED,
     LOG_PROMOTION_UNAVAILABLE,
     LOG_SUCCESS,
@@ -95,8 +99,6 @@ class DecisionInput:
     now: datetime
     stats_snapshot: dict | None
     bids_info: dict | None
-    last_set_at: datetime | None
-    cached_event: str | None
 
 
 # ---------- helpers ----------
@@ -141,23 +143,36 @@ def _bounds_from_promotion(
 
 
 def _clamp_limit(daily_budget: int | None, bounds: CriticalBidsData) -> int | None:
+    """Лимит для set_manual_bid с округлением до рубля при clamp'е.
+
+    - `daily_budget is None` → None: limitPenny в Avito не отправляем.
+    - daily_budget < critical_min_limit → ceil(min/100)*100 (вверх до рубля,
+      чтобы попасть >= min).
+    - daily_budget > critical_max_limit → floor(max/100)*100 (вниз до рубля,
+      чтобы попасть <= max).
+    - daily_budget внутри границ → отдаём как есть.
+    """
     if daily_budget is None:
         return None
-    return max(
-        bounds.critical_min_limit,
-        min(bounds.critical_max_limit, daily_budget),
-    )
+    if daily_budget < bounds.critical_min_limit:
+        return ((bounds.critical_min_limit + 99) // 100) * 100
+    if daily_budget > bounds.critical_max_limit:
+        return (bounds.critical_max_limit // 100) * 100
+    return daily_budget
 
 
 def _system_note_text(
-    log_message: str, cached_event: str | None
+    log_message: str, prev_log_message: str | None
 ) -> tuple[bool, str] | None:
-    """Возвращает (need_write, text) для системной заметки."""
-    if cached_event == log_message:
+    """Возвращает (need_write, text) для системной заметки.
+
+    Дедупликация по последнему канонически записанному `log_message`
+    (`ManualPromotion.log_message`): если состояние не сменилось — не пишем.
+    """
+    if prev_log_message == log_message:
         return None
     if log_message in SOFT_DISABLED_LOGS or log_message in (
         LOG_DISABLED_BY_TARIFF,
-        LOG_LIMIT_EXCEEDED,
         LOG_PROMOTION_UNAVAILABLE,
         LOG_DISABLED_BY_ACCOUNT_DELETED,
         LOG_BID_CHANGE_FAILED,
@@ -181,14 +196,18 @@ def _early_validation(
         return Decision(
             action=Action.NOOP,
             log_message=LOG_USER_DELETED,
-            write_system_note=_system_note_text(LOG_USER_DELETED, inp.cached_event),
+            write_system_note=_system_note_text(
+                LOG_USER_DELETED, inp.ctx.promotion.log_message
+            ),
         )
-    # 2. not configured
-    if p.bid is None or p.daily_budget is None:
+    # 2. not configured (bid обязателен; daily_budget — опционален)
+    if p.bid is None:
         return Decision(
             action=Action.NOOP,
             log_message=LOG_NOT_CONFIGURED,
-            write_system_note=_system_note_text(LOG_NOT_CONFIGURED, inp.cached_event),
+            write_system_note=_system_note_text(
+                LOG_NOT_CONFIGURED, inp.ctx.promotion.log_message
+            ),
         )
     # 3. tariff
     today = inp.now.date()
@@ -202,17 +221,10 @@ def _early_validation(
             action=Action.NOOP,
             log_message=LOG_DISABLED_BY_TARIFF,
             write_system_note=_system_note_text(
-                LOG_DISABLED_BY_TARIFF, inp.cached_event
+                LOG_DISABLED_BY_TARIFF, inp.ctx.promotion.log_message
             ),
         )
-    # 4. limit
-    if ctx.profile_rank > ctx.profile.manual_promotion_limit:
-        return Decision(
-            action=Action.NOOP,
-            log_message=LOG_LIMIT_EXCEEDED,
-            write_system_note=_system_note_text(LOG_LIMIT_EXCEEDED, inp.cached_event),
-        )
-    # 5. need critical_* — запрашиваем bids
+    # 4. need critical_* — запрашиваем bids
     if bounds is None:
         return Decision(action=Action.FETCH_BIDS)
     return None
@@ -266,7 +278,9 @@ def _build_disable(
     log_message: str,
 ) -> Decision:
     last_ts = inp.ctx.last_log.timestamp if inp.ctx.last_log else None
-    write_log = _hourly_log_due(last_ts, inp.now) or (inp.cached_event != log_message)
+    write_log = _hourly_log_due(last_ts, inp.now) or (
+        inp.ctx.promotion.log_message != log_message
+    )
     compare = _compare_percent_for(bounds.disabled_bid, inp.bids_info)
     return Decision(
         action=Action.REMOVE,
@@ -274,7 +288,7 @@ def _build_disable(
         compare_percent=compare,
         write_log=write_log,
         log_bid=bounds.disabled_bid,
-        write_system_note=_system_note_text(log_message, inp.cached_event),
+        write_system_note=_system_note_text(log_message, inp.ctx.promotion.log_message),
     )
 
 
@@ -308,7 +322,7 @@ def compute_target_state(inp: DecisionInput) -> Decision:
                 action=Action.NOOP,
                 log_message=LOG_PROMOTION_UNAVAILABLE,
                 write_system_note=_system_note_text(
-                    LOG_PROMOTION_UNAVAILABLE, inp.cached_event
+                    LOG_PROMOTION_UNAVAILABLE, inp.ctx.promotion.log_message
                 ),
             )
 
@@ -326,7 +340,9 @@ def compute_target_state(inp: DecisionInput) -> Decision:
         return Decision(
             action=Action.NOOP,
             log_message=LOG_BID_BELOW_MIN,
-            write_system_note=_system_note_text(LOG_BID_BELOW_MIN, inp.cached_event),
+            write_system_note=_system_note_text(
+                LOG_BID_BELOW_MIN, inp.ctx.promotion.log_message
+            ),
         )
     # 15. ставка выше максимума
     if bid > bounds.critical_max_bid:
@@ -344,8 +360,12 @@ def compute_target_state(inp: DecisionInput) -> Decision:
     # считаем drift, чтобы дотолкнуть лимит на следующем cooldown'е.
     last_bid = inp.ctx.last_log.bid if inp.ctx.last_log else None
     drift = last_bid != bid or limit_to_send is not None
-    cooldown_ok = inp.last_set_at is None or (inp.now - inp.last_set_at) >= COOLDOWN
     last_log_ts = ctx.last_log.timestamp if ctx.last_log else None
+    # Cooldown-якорь — последняя запись в manual_promotion_log (там лежат
+    # и SET_BID, и почасовые snapshot'ы). Worst case: drift сразу после
+    # hourly snapshot'а будет ждать ещё час до пуша. На стабильном
+    # состоянии разницы нет.
+    cooldown_ok = last_log_ts is None or (inp.now - last_log_ts) >= COOLDOWN
     hourly_due = _hourly_log_due(last_log_ts, inp.now)
 
     # Если будем писать лог, а bids_info ещё нет — нужен FETCH_BIDS
@@ -366,7 +386,9 @@ def compute_target_state(inp: DecisionInput) -> Decision:
             compare_percent=compare,
             write_log=True,
             log_bid=bid,
-            write_system_note=_system_note_text(LOG_SUCCESS, inp.cached_event),
+            write_system_note=_system_note_text(
+                LOG_SUCCESS, inp.ctx.promotion.log_message
+            ),
         )
     if drift and not cooldown_ok:
         # 17. ждём окончания cooldown
@@ -378,7 +400,7 @@ def compute_target_state(inp: DecisionInput) -> Decision:
         compare_percent=compare,
         write_log=hourly_due,
         log_bid=bid,
-        write_system_note=_system_note_text(LOG_SUCCESS, inp.cached_event),
+        write_system_note=_system_note_text(LOG_SUCCESS, inp.ctx.promotion.log_message),
     )
 
 
@@ -402,7 +424,7 @@ def recompute_with_bids(
             Decision(
                 action=Action.NOOP,
                 log_message=msg,
-                write_system_note=_system_note_text(msg, inp.cached_event),
+                write_system_note=_system_note_text(msg, inp.ctx.promotion.log_message),
             ),
             None,
         )
@@ -435,8 +457,6 @@ def recompute_with_bids(
         now=inp.now,
         stats_snapshot=inp.stats_snapshot,
         bids_info=bids_info,
-        last_set_at=inp.last_set_at,
-        cached_event=inp.cached_event,
     )
     decision = compute_target_state(new_inp)
     if update_payload is not None:

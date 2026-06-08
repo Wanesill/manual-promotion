@@ -9,9 +9,17 @@ API. Каждые 5 минут читает таблицу `manual_promotion` и
 
 ## Что делает сервис
 
-- **Диспетчер-цикл (5 мин)** — читает свежий снимок активных
-  `manual_promotion` (`status=TRUE`, `deleted_at IS NULL`), обрабатывает
-  по аккаунтам параллельно, по объявлениям внутри аккаунта — последовательно.
+- **Supervisor + per-account workers.** Один supervisor-таск каждые 5 мин
+  читает список активных аккаунтов (тех, у кого есть строки
+  `manual_promotion` со `status=TRUE`, `deleted_at IS NULL`), спавнит
+  воркер на каждый новый аккаунт и сигналит остановку отвалившимся
+  (воркер выходит между объявлениями, не разрывая сетевой вызов).
+- **Цикл одного аккаунта.** Воркер бесконечно повторяет итерации с целевым
+  интервалом 5 мин. Если у аккаунта 5000 объявлений и большая часть
+  требует `getBids` (лимит Avito 20/мин), одна итерация может занять
+  ~4 ч — это норма, хард-таймаута нет. Чтобы бюджет/метрики не сильно
+  устаревали, каждые 5 мин внутри итерации воркер дозагружает `stats` и
+  пересчитывает `now`.
 - **Решающее правило** — чистая функция `compute_target_state` с 18 ранними
   выходами: статус объявления → бюджет/тариф → расписание → метрики
   (показы / просмотры / контакты / CPV / CPC) → границы ставки → drift
@@ -45,10 +53,10 @@ API. Каждые 5 минут читает таблицу `manual_promotion` и
 - **Rate-лимитера нет.** На 429/5xx `AvitoService` сам ждёт по
   `x-ratelimit-retry-after` и повторяет запрос. Внутри аккаунта вызовы
   последовательные (`asyncio.gather` — только по аккаунтам).
-- **State store в Redis**: `mp:last_set:{ad_id}` (TTL ~25 ч) — для часового
-  cooldown; `mp:last_event:{promotion_id}` (без TTL) — для дедупликации
-  системных заметок. Namespace `mp:` — фиксированный (сервис рассчитан на
-  один инстанс).
+- **Dispatcher state — в PostgreSQL.** Cooldown 1 ч считается от
+  `manual_promotion_log.timestamp` (`ctx.last_log`), дедупликация
+  системных заметок — по `manual_promotion.log_message`. Отдельного state
+  store в Redis нет.
 - **Время сервера = МСК.** `datetime.now()` без таймзоны.
 - **Все user-visible строки на русском.** Константы `LOG_*` и текст заметок
   — часть публичного контракта с родительским API.
@@ -82,7 +90,7 @@ APP_CONFIG=config.yml poetry run python -m app
 | `redis`    | DSN Redis (`redis://…/0`)                                                                   |
 | `logging`  | Уровень, дублирование в stderr (файлы — всегда, в `logs/YYYY-MM-DD.log`)                    |
 
-Параметры цикла (`CYCLE_INTERVAL_S=300`, `MAX_CYCLE_TIMEOUT_MULTIPLIER=3`)
+Параметры цикла (`CYCLE_INTERVAL_S=300`, `STATS_REFRESH_INTERVAL_S=300`)
 зашиты константами в [`app/dispatcher/process_dispatcher.py`](./app/dispatcher/process_dispatcher.py)
 — сервис рассчитан на один инстанс без фильтрации по `profile_id`.
 
@@ -97,17 +105,16 @@ app/
 │   ├── logging_utils.py         # sanitize_message
 │   └── time_utils.py            # расписание работы (work_days, work_hours_mask)
 ├── database/
-│   ├── database.py              # DAL: load_active_promotions, load_today_stats,
-│   │                            #   insert_log, insert_system_note, upsert_critical,
-│   │                            #   bulk_update_log_message
+│   ├── database.py              # DAL: load_active_account_ids, load_account_promotions,
+│   │                            #   load_today_stats, insert_log, insert_system_note,
+│   │                            #   upsert_critical, bulk_update_log_message
 │   └── models/                  # SQLAlchemy 2.0 — read-only mirror схемы родителя
 ├── external_services/
 │   └── avito_service.py         # singleton ClientSession, retry, AccountForbiddenError
 ├── infra/
-│   ├── redis_cache.py           # AvitoCache (mp:bids:*) — Redis + cachetools fallback
-│   └── state_store.py           # StateStore — last_set_at / last_event
+│   └── redis_cache.py           # AvitoCache (mp:bids:*) — Redis + cachetools fallback
 └── dispatcher/
-    ├── process_dispatcher.py    # cycle() + run_dispatcher_loop
+    ├── process_dispatcher.py    # supervisor + per-account worker (run_dispatcher)
     ├── account_session.py       # обёртка над AvitoService (проверка токена + bids-кэш)
     ├── critical_bids.py         # parse_critical_bids, pick_compare_percent
     ├── decision_engine.py       # compute_target_state — чистая функция
@@ -122,7 +129,8 @@ app/
   в Avito» для drift-детекта.
 - **`manual_promotion_note(kind="system")`** — заметка пишется один раз на
   событие; новая запись только если канонический `log_message` сменился
-  по сравнению с кэшем в Redis (`mp:last_event:*`).
+  относительно `ManualPromotion.log_message` (записывается этим же
+  сервисом в конце цикла).
 - **Файловые логи** — `logs/YYYY-MM-DD.log`, ротации по retention нет —
   оставлено на внешний logrotate / systemd.
 
