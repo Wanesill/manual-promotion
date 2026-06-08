@@ -49,12 +49,11 @@ app/
 │                                  AccountForbiddenError, 429/5xx retry via
 │                                  `x-ratelimit-retry-after`
 ├── infra/
-│   ├── rate_limiter.py          AccountRateLimiter — sliding-window per (acc, endpoint)
 │   ├── redis_cache.py           AvitoCache — Redis + cachetools fallback
 │   └── state_store.py           StateStore — last_set_at, last_event
 └── dispatcher/
     ├── process_dispatcher.py    cycle() + run_dispatcher_loop (fixed cycle_interval windows)
-    ├── account_session.py       wraps AvitoService, acquires rate-limit before each call
+    ├── account_session.py       wraps AvitoService (token check + bids cache)
     ├── critical_bids.py         parse_critical_bids, pick_compare_percent
     ├── decision_engine.py       compute_target_state — pure function, 18 stages
     └── apply_decision.py        only mutating layer (calls Avito + writes DB rows)
@@ -150,6 +149,11 @@ side.
 | `get_bids` (per ad)               | 20/min/account    | `mp:bids:{ad_id}` 3600s                      |
 | `set_manual_bid`                  | 20/min/account    | — (invalidates bids cache)                   |
 | `remove_cpxpromo`                 | 300/min/account   | —                                            |
+
+Проактивного rate-лимитера нет: на 429/5xx `AvitoService` сам ждёт по
+`x-ratelimit-retry-after` и повторяет запрос. Внутри аккаунта вызовы
+последовательные (`asyncio.gather` — только по аккаунтам), так что
+неконтролируемого фан-аута нет.
 
 The OAuth `authenticate` endpoint is **not** called from this service —
 token refresh is owned by the parent API.

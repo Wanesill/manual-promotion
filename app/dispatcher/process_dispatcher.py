@@ -34,7 +34,6 @@ if TYPE_CHECKING:
         Snapshot,
     )
     from app.database.models import Account
-    from app.infra.rate_limiter import AccountRateLimiter
     from app.infra.redis_cache import AvitoCache
     from app.infra.state_store import StateStore
 
@@ -55,13 +54,11 @@ MAX_CYCLE_TIMEOUT_MULTIPLIER: Final[int] = 3
 async def cycle(
     database: Database,
     cache: AvitoCache,
-    rate_limiter: AccountRateLimiter,
     state: StateStore,
     cycle_number: int,
 ) -> None:
     """Один полный цикл: загружает snapshot и обрабатывает по аккаунтам."""
     now = datetime.now()
-    rate_limiter.gc()
     snapshot: Snapshot = await database.load_active_promotions()
     if not snapshot.by_account:
         logger.info("Цикл {} — активных promotion'ов нет", cycle_number)
@@ -83,7 +80,6 @@ async def cycle(
                 now=now,
                 database=database,
                 cache=cache,
-                rate_limiter=rate_limiter,
                 state=state,
             )
             for account, contexts in snapshot.by_account.values()
@@ -98,7 +94,6 @@ async def _process_account(
     now: datetime,
     database: Database,
     cache: AvitoCache,
-    rate_limiter: AccountRateLimiter,
     state: StateStore,
 ) -> None:
     """Обрабатывает все promotion'ы одного аккаунта последовательно."""
@@ -111,7 +106,7 @@ async def _process_account(
         )
         return
 
-    session = AccountSession(account=account, rate_limiter=rate_limiter, cache=cache)
+    session = AccountSession(account=account, cache=cache)
     try:
         await session.ensure_token()
     except AccountTokenError as err:
@@ -200,7 +195,6 @@ async def _bulk_set_log(
 async def run_dispatcher_loop(
     database: Database,
     cache: AvitoCache,
-    rate_limiter: AccountRateLimiter,
     state: StateStore,
     stop_event: asyncio.Event,
 ) -> None:
@@ -215,7 +209,6 @@ async def run_dispatcher_loop(
                 cycle(
                     database=database,
                     cache=cache,
-                    rate_limiter=rate_limiter,
                     state=state,
                     cycle_number=cycle_number,
                 ),

@@ -5,8 +5,8 @@ Singleton aiohttp.ClientSession + TCPConnector(30 per host, DNS 5 мин).
 повторяются внутри метода с уважением заголовка `x-ratelimit-retry-after`;
 HTTP 403 пробрасывается как AccountForbiddenError для caller-side handling.
 
-Rate limits (per account) контролируются НЕ здесь, а в `AccountRateLimiter`
-(infra/rate_limiter.py) — вызывается caller'ом перед методом.
+Проактивного rate-лимитинга нет — рассчитываем на инструкции Avito в
+заголовке `x-ratelimit-retry-after` при 429 и реактивный backoff.
 
 Аутентификация (получение access_token по client_id/secret) НЕ выполняется
 этим сервисом — токен пишет родительский API. Здесь токен только читается
@@ -175,7 +175,7 @@ class AvitoService:
         while True:
             try:
                 async with session.get(
-                    url=(f"https://api.avito.ru/cpxpromo/1/getBids/{ad_id}"),
+                    url=f"https://api.avito.ru/cpxpromo/1/getBids/{ad_id}",
                     headers=self.get_headers(),
                     timeout=self.ten_minutes_timeout,
                 ) as response:

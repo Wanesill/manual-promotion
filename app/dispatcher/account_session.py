@@ -1,11 +1,13 @@
 """Обёртка над AvitoService для одного аккаунта.
 
-Делает 3 вещи:
+Делает 2 вещи:
 1. ensure_token — читает access_token из БД (refresh выполняет родительский
    сервис; здесь токен только проверяется на валидность).
-2. Прокидывает rate-limit acquire перед каждым вызовом Avito API.
-3. Прозрачно кэширует bids (границы ставок) в AvitoCache. Snapshot текущих
+2. Прозрачно кэширует bids (границы ставок) в AvitoCache. Snapshot текущих
    ставок с Avito не запрашиваем — drift считаем по `ManualPromotionLog.bid`.
+
+Rate limiting не делаем проактивно: на 429/5xx AvitoService сам ждёт по
+`x-ratelimit-retry-after` и повторяет запрос.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from app.external_services.avito_service import (
     AccountForbiddenError,
     AvitoService,
 )
-from app.infra.rate_limiter import AccountRateLimiter, Endpoint
 from app.infra.redis_cache import AvitoCache
 from app.log_messages import LOG_DISABLED_BY_TOKEN_EXPIRED
 
@@ -42,11 +43,9 @@ class AccountSession:
     def __init__(
         self,
         account: Account,
-        rate_limiter: AccountRateLimiter,
         cache: AvitoCache,
     ) -> None:
         self.account = account
-        self._rate_limiter = rate_limiter
         self._cache = cache
         self._avito: AvitoService | None = None
 
@@ -79,7 +78,6 @@ class AccountSession:
         """get_bids(ad_id) — границы и таблица compare. Кэш 1ч."""
 
         async def _fetch() -> dict | None:
-            await self._rate_limiter.acquire(self.account.id, Endpoint.GET_BIDS)
             try:
                 result = await self.avito.get_bids(ad_id=ad_id)
             except AccountForbiddenError:
@@ -91,13 +89,11 @@ class AccountSession:
     async def set_manual_bid(
         self, ad_id: int, bid: int, limit_penny: int | None
     ) -> bool | None:
-        await self._rate_limiter.acquire(self.account.id, Endpoint.SET_BID)
         return await self.avito.set_manual_bid(
             ad_id=ad_id, bid=bid, limit_penny=limit_penny
         )
 
     async def remove_cpxpromo(self, ad_id: int) -> None:
-        await self._rate_limiter.acquire(self.account.id, Endpoint.REMOVE)
         await self.avito.remove_cpxpromo(ad_id=ad_id)
 
     async def invalidate_caches_for_ad(self, ad_id: int) -> None:
