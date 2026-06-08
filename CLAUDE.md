@@ -26,8 +26,9 @@ Critical constraints baked into the design:
   `disabled_bid`) and to the append-only tables `manual_promotion_log` and
   `manual_promotion_note`.
 - **Metric statistics come from the DB**, not from the Avito API. The
-  parent service populates `ad_detail_statistic` as a cumulative snapshot;
-  daily delta = `MAX − MIN` over today's rows.
+  parent service populates `ad_detail_statistic` as a per-day cumulative
+  counter that resets at 00:00; today's value = latest row of today
+  per ad (`DISTINCT ON (ad_id) ... ORDER BY timestamp DESC`).
 - **Server is in MSK** — `datetime.now()` without tzinfo is the source of
   truth for "now". Don't add tz conversions.
 
@@ -81,10 +82,12 @@ account). Drift детектится по `ctx.last_log.bid` — текущее 
   `ManualPromotion`/`Account`/`Ad`/`Profile`, filters `status IS TRUE`,
   `deleted_at IS NULL`. Returns a `Snapshot` grouped by account. No
   profile filtering — this is a single-instance service.
-- `load_today_stats(account_id, today=None)` — `MAX − MIN` aggregation of
+- `load_today_stats(account_id, today=None)` — `DISTINCT ON (ad_id)` over
+  `ad_detail_statistic` rows since 00:00, ordered by `ad_id, timestamp DESC`,
+  joined with `Ad`. Возвращает накопленные сегодня
   `views`, `contacts`, `impressions`, `presence_spending`, `promo_spending`,
-  `rest_spending` from `ad_detail_statistic` for today, joined with `Ad`.
-  Returns `{avito_ad_id: {...camelCase keys for the decision engine...}}`.
+  `rest_spending` в формате `{avito_ad_id: {...camelCase keys for the
+  decision engine...}}`.
 - `insert_log(promotion_id, bid, compare_percent, timestamp)` — idempotent
   via `ON CONFLICT DO NOTHING` on `(promotion_id, timestamp)`.
 - `insert_system_note(promotion_id, text, created_at)` — system notes are

@@ -136,12 +136,13 @@ class Database:
     async def load_today_stats(
         self, account_id: int, today: date | None = None
     ) -> dict[int, dict]:
-        """Дневная дельта метрик для всех объявлений аккаунта.
+        """Дневные метрики для всех объявлений аккаунта.
 
-        Метрики в `ad_detail_statistic` накопительные (snapshot'ы с
-        timestamp'ом). Дневная дельта = MAX − MIN значения за период
-        с 00:00 сегодня. Тот же приём использует API-сервис
-        (см. docs/api/manual_promotion/service.py).
+        Каждая запись в `ad_detail_statistic` — накопительный счётчик за
+        текущий день (родительский сервис сбрасывает значения в 00:00),
+        поэтому достаточно взять последнюю запись за сегодня на каждое
+        объявление (`DISTINCT ON (ad_id) ... ORDER BY ad_id, timestamp DESC`,
+        использует индекс `ix_ads_ad_id_ts_desc`).
 
         Возвращает `{avito_ad_id: {views, contacts, impressions,
         presenceSpending, promoSpending, restSpending}}` — camelCase
@@ -153,35 +154,18 @@ class Database:
         stmt = (
             select(
                 Ad.ad_id,
-                (
-                    func.max(AdDetailStatistic.views)
-                    - func.min(AdDetailStatistic.views)
-                ).label("views"),
-                (
-                    func.max(AdDetailStatistic.contacts)
-                    - func.min(AdDetailStatistic.contacts)
-                ).label("contacts"),
-                (
-                    func.max(AdDetailStatistic.impressions)
-                    - func.min(AdDetailStatistic.impressions)
-                ).label("impressions"),
-                (
-                    func.max(AdDetailStatistic.presence_spending)
-                    - func.min(AdDetailStatistic.presence_spending)
-                ).label("presence_spending"),
-                (
-                    func.max(AdDetailStatistic.promo_spending)
-                    - func.min(AdDetailStatistic.promo_spending)
-                ).label("promo_spending"),
-                (
-                    func.max(AdDetailStatistic.rest_spending)
-                    - func.min(AdDetailStatistic.rest_spending)
-                ).label("rest_spending"),
+                AdDetailStatistic.views,
+                AdDetailStatistic.contacts,
+                AdDetailStatistic.impressions,
+                AdDetailStatistic.presence_spending,
+                AdDetailStatistic.promo_spending,
+                AdDetailStatistic.rest_spending,
             )
+            .distinct(AdDetailStatistic.ad_id)
             .join(Ad, Ad.id == AdDetailStatistic.ad_id)
             .where(AdDetailStatistic.account_id == account_id)
             .where(AdDetailStatistic.timestamp >= day_start)
-            .group_by(Ad.ad_id)
+            .order_by(AdDetailStatistic.ad_id, AdDetailStatistic.timestamp.desc())
         )
 
         async with self._sessionmaker() as session:
