@@ -118,25 +118,11 @@ async def main() -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop_event.set)
 
-    dispatcher_task = asyncio.create_task(
-        run_dispatcher(
-            database=database,
-            cache=cache,
-            stop_event=stop_event,
-        )
-    )
-
     logger.info("Сервис manual-promotion запущен")
     try:
-        await asyncio.wait(
-            {dispatcher_task, asyncio.create_task(stop_event.wait())},
-            return_when=asyncio.FIRST_COMPLETED,
+        await run_dispatcher(
+            database=database, cache=cache, stop_event=stop_event
         )
-        if not dispatcher_task.done():
-            stop_event.set()
-            dispatcher_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await dispatcher_task
     finally:
         await AvitoService.close_session()
         await redis.aclose()
