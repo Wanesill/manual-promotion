@@ -70,7 +70,6 @@ def setup_logging() -> None:
         level=cfg.level,
         format=LOG_FORMAT,
         encoding="utf-8",
-        retention="30 days",
     )
 
 
@@ -133,7 +132,7 @@ async def main() -> None:
 
     logger.info("Сервис manual-promotion запущен")
     try:
-        done, pending = await asyncio.wait(
+        await asyncio.wait(
             {dispatcher_task, asyncio.create_task(stop_event.wait())},
             return_when=asyncio.FIRST_COMPLETED,
         )
