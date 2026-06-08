@@ -1,11 +1,13 @@
 """Redis-кэш Avito-снапшотов с in-process fallback.
 
 Ключи:
-- mp:rates:{account_id}   TTL 300
 - mp:bids:{ad_id}         TTL 3600
 
 Токены аккаунтов НЕ кэшируем — читаем их напрямую из БД (Account.access_token),
 refresh выполняет родительский сервис.
+
+Snapshot текущих установленных ставок с Avito не запрашиваем и не кэшируем —
+drift детектится по `ManualPromotionLog.bid`.
 
 Статистика (`ad_detail_statistic`) НЕ кэшируется здесь — читаем напрямую
 из БД каждый цикл (5 мин), родительский сервис её ведёт.
@@ -30,7 +32,6 @@ from redis.exceptions import RedisError
 
 __all__ = ["AvitoCache"]
 
-RATES_TTL_S: Final[int] = 300
 BIDS_TTL_S: Final[int] = 3600
 NAMESPACE: Final[str] = "mp"
 
@@ -40,7 +41,6 @@ class AvitoCache:
 
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
-        self._rates_local: TTLCache = TTLCache(maxsize=10_000, ttl=RATES_TTL_S)
         self._bids_local: TTLCache = TTLCache(maxsize=100_000, ttl=BIDS_TTL_S)
         self._key_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
@@ -89,42 +89,6 @@ class AvitoCache:
             await self._redis.delete(key)
         except RedisError as err:
             logger.warning("Redis del {} ошибка: {}", key, err)
-
-    # ---------- rates (текущие установленные ставки аккаунта) ----------
-
-    @staticmethod
-    def _rates_key(account_id: int) -> str:
-        return f"{NAMESPACE}:rates:{account_id}"
-
-    async def get_or_set_rates(
-        self,
-        account_id: int,
-        fetch: Callable[[], Awaitable[dict]],
-    ) -> dict:
-        """Возвращает snapshot get_actual_rates: dict[ad_id, dict]."""
-        key = self._rates_key(account_id)
-        cached = await self._redis_get(key)
-        if isinstance(cached, dict):
-            return {int(k): v for k, v in cached.items()}
-        if cached is None and key in self._rates_local:
-            return self._rates_local[key]
-
-        lock = await self._lock(key)
-        async with lock:
-            cached = await self._redis_get(key)
-            if isinstance(cached, dict):
-                return {int(k): v for k, v in cached.items()}
-            if cached is None and key in self._rates_local:
-                return self._rates_local[key]
-            fresh = await fetch()
-            await self._redis_setex(key, RATES_TTL_S, fresh)
-            self._rates_local[key] = fresh
-            return fresh
-
-    async def invalidate_rates(self, account_id: int) -> None:
-        key = self._rates_key(account_id)
-        await self._redis_del(key)
-        self._rates_local.pop(key, None)
 
     # ---------- bids (границы ставок) ----------
 

@@ -115,8 +115,6 @@ class AvitoService:
     _session_lock: asyncio.Lock = asyncio.Lock()
 
     ten_minutes_timeout: ClientTimeout = ClientTimeout(total=600)
-    twenty_minutes_timeout: ClientTimeout = ClientTimeout(total=1200)
-    sixty_minutes_timeout: ClientTimeout = ClientTimeout(total=3600)
 
     def __init__(self, user_id: int, token: str) -> None:
         self.user_id = user_id
@@ -159,51 +157,6 @@ class AvitoService:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
-
-    # ---------- batch: текущие ставки ----------
-
-    @retry_with_backoff()
-    async def get_actual_rates(self, ads_id: list[int]) -> dict:
-        """POST /cpxpromo/1/getPromotionsByItemIds — batch текущих ставок.
-
-        Возвращает сырой ответ Avito. Caller извлекает ставки по ad_id.
-        """
-        if not ads_id:
-            return {}
-        session = await self.get_session()
-        payload: dict[str, list[int]] = {"itemIds": ads_id}
-
-        while True:
-            try:
-                async with session.post(
-                    url="https://api.avito.ru/cpxpromo/1/getPromotionsByItemIds",
-                    json=payload,
-                    headers=self.get_headers(),
-                    timeout=self.sixty_minutes_timeout,
-                ) as response:
-                    if response.status in (429, 500, 503, 504):
-                        retry_after = (
-                            int(response.headers.get("x-ratelimit-retry-after", "60"))
-                            + 1
-                        )
-                        await asyncio.sleep(retry_after)
-                        continue
-                    if response.status == 403:
-                        raise AccountForbiddenError(user_id=self.user_id)
-                    response.raise_for_status()
-                    return await response.json()
-            except ClientError as err:
-                if not isinstance(
-                    err,
-                    (
-                        ServerDisconnectedError,
-                        ClientConnectorError,
-                        ClientPayloadError,
-                    ),
-                ):
-                    logger.exception("get_actual_rates сбой, аккаунт {}", self.user_id)
-                    return {}
-                raise
 
     # ---------- per-ad: границы ставок ----------
 

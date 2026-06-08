@@ -66,14 +66,15 @@ app/
 (constant in `app/dispatcher/process_dispatcher.py`, default 300) with a
 hard timeout of `CYCLE_INTERVAL_S * MAX_CYCLE_TIMEOUT_MULTIPLIER`
 (default ×3). Both knobs are intentionally hard-coded — this service runs
-as a single instance, no per-deployment tuning is expected. One cycle: load active promotions (one SQL with the necessary
-JOINs), group by `account`, fan out per-account in `asyncio.gather`. Inside an
-account: one batch `getPromotionsByItemIds`, one `load_today_stats`
+as a single instance, no per-deployment tuning is expected. One cycle: load
+active promotions (one SQL with the necessary JOINs), group by `account`, fan
+out per-account in `asyncio.gather`. Inside an account: one `load_today_stats`
 (from `ad_detail_statistic`), then sequentially per ad:
 `compute_target_state` → if it needs bid bounds, `fetch_bids` + recompute →
 `apply_decision`. Per-account-sequential preserves the rate-limit
-(`set_manual_bid` 20/min, `remove_cpxpromo` 300/min,
-`get_bids`/`get_actual_rates` 20/min per account).
+(`set_manual_bid` 20/min, `remove_cpxpromo` 300/min, `get_bids` 20/min per
+account). Drift детектится по `ctx.last_log.bid` — текущее состояние на
+стороне Avito с API не запрашиваем.
 
 ## Key DAL methods (`app/database/database.py`)
 
@@ -146,13 +147,19 @@ side.
 
 | Endpoint                          | Avito limit       | Cache (Redis TTL)                            |
 | --------------------------------- | ----------------- | -------------------------------------------- |
-| `getPromotionsByItemIds` (batch)  | 20/min/account    | `mp:rates:{account_id}` 300s                 |
 | `get_bids` (per ad)               | 20/min/account    | `mp:bids:{ad_id}` 3600s                      |
-| `set_manual_bid`                  | 20/min/account    | — (invalidates rates)                        |
+| `set_manual_bid`                  | 20/min/account    | — (invalidates bids cache)                   |
 | `remove_cpxpromo`                 | 300/min/account   | —                                            |
 
 The OAuth `authenticate` endpoint is **not** called from this service —
 token refresh is owned by the parent API.
+
+The batch `getPromotionsByItemIds` endpoint is **not** called either — drift
+("did we already send this bid?") is detected against the last row in
+`manual_promotion_log` rather than against Avito's actual state. Trade-off: for
+ads with `daily_budget` set (which is every active row, per stage 2), this
+re-pushes `set_manual_bid` once per cooldown (1h) even when nothing changed.
+That's within rate limits.
 
 Statistics (`ad_detail_statistic`) are **not** cached in Redis — they're
 read from PostgreSQL every cycle (cheap; the parent service maintains the

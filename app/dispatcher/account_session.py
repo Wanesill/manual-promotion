@@ -4,7 +4,8 @@
 1. ensure_token — читает access_token из БД (refresh выполняет родительский
    сервис; здесь токен только проверяется на валидность).
 2. Прокидывает rate-limit acquire перед каждым вызовом Avito API.
-3. Прозрачно кэширует rates / bids в AvitoCache (stats читаем из БД).
+3. Прозрачно кэширует bids (границы ставок) в AvitoCache. Snapshot текущих
+   ставок с Avito не запрашиваем — drift считаем по `ManualPromotionLog.bid`.
 """
 
 from __future__ import annotations
@@ -70,23 +71,6 @@ class AccountSession:
             raise RuntimeError("ensure_token() must be called first")
         return self._avito
 
-    async def fetch_actual_rates_batch(self, ad_ids: list[int]) -> dict[int, dict]:
-        """Snapshot getPromotionsByItemIds: dict[ad_id, item-payload]."""
-
-        async def _fetch() -> dict:
-            await self._rate_limiter.acquire(self.account.id, Endpoint.BATCH_RATES)
-            return await self.avito.get_actual_rates(ads_id=ad_ids)
-
-        raw = await self._cache.get_or_set_rates(self.account.id, _fetch)
-        # Структура ответа Avito: {"items": [{"itemId", "manual", ...}]}
-        # На всякий случай поддерживаем уже-конвертированный dict из кэша.
-        if not raw:
-            return {}
-        if isinstance(raw, dict) and "items" in raw:
-            items = raw.get("items", [])
-            return {int(it["itemId"]): it for it in items if "itemId" in it}
-        return raw  # type: ignore[return-value]
-
     async def fetch_stats_today(self, database: Database) -> dict[int, dict]:
         """Дневная дельта метрик из `ad_detail_statistic` (не Avito API)."""
         return await database.load_today_stats(account_id=self.account.id)
@@ -117,5 +101,4 @@ class AccountSession:
         await self.avito.remove_cpxpromo(ad_id=ad_id)
 
     async def invalidate_caches_for_ad(self, ad_id: int) -> None:
-        await self._cache.invalidate_rates(self.account.id)
         await self._cache.invalidate_bids(ad_id)

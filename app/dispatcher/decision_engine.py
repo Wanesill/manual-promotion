@@ -93,7 +93,6 @@ class Decision:
 class DecisionInput:
     ctx: PromotionContext
     now: datetime
-    rates_snapshot: dict | None
     stats_snapshot: dict | None
     bids_info: dict | None
     last_set_at: datetime | None
@@ -339,12 +338,12 @@ def compute_target_state(inp: DecisionInput) -> Decision:
     limit_to_send = _clamp_limit(p.daily_budget, bounds)
 
     # 16-17. drift detection
-    rates = inp.rates_snapshot or {}
-    current_bid = rates.get("bidPenny")
-    current_limit = rates.get("limitPenny")
-    drift = current_bid != bid or (
-        limit_to_send is not None and current_limit != limit_to_send
-    )
+    # Источник "что уже стоит на Avito" — наш собственный лог ставок
+    # (`ManualPromotionLog.bid`). Лимит туда не пишем, поэтому при заданном
+    # `limit_to_send` (== `daily_budget != None`, гарантировано stage 2)
+    # считаем drift, чтобы дотолкнуть лимит на следующем cooldown'е.
+    last_bid = inp.ctx.last_log.bid if inp.ctx.last_log else None
+    drift = last_bid != bid or limit_to_send is not None
     cooldown_ok = inp.last_set_at is None or (inp.now - inp.last_set_at) >= COOLDOWN
     last_log_ts = ctx.last_log.timestamp if ctx.last_log else None
     hourly_due = _hourly_log_due(last_log_ts, inp.now)
@@ -434,7 +433,6 @@ def recompute_with_bids(
     new_inp = DecisionInput(
         ctx=inp.ctx,
         now=inp.now,
-        rates_snapshot=inp.rates_snapshot,
         stats_snapshot=inp.stats_snapshot,
         bids_info=bids_info,
         last_set_at=inp.last_set_at,

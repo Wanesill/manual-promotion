@@ -118,17 +118,7 @@ async def _process_account(
         await _bulk_set_log(database, contexts, err.log_message, state)
         return
 
-    try:
-        ad_ids = [c.ad.ad_id for c in contexts]
-        rates = await session.fetch_actual_rates_batch(ad_ids)
-        stats = await session.fetch_stats_today(database)
-    except AccountForbiddenError:
-        logger.warning(
-            "Аккаунт {} вернул 403 при загрузке snapshot'а",
-            account.user_id,
-        )
-        await _bulk_set_log(database, contexts, LOG_DISABLED_BY_AUTH_FAILED, state)
-        return
+    stats = await session.fetch_stats_today(database)
 
     updates: list[tuple[int, str | None]] = []
     for ctx in contexts:
@@ -139,7 +129,6 @@ async def _process_account(
                 session=session,
                 database=database,
                 state=state,
-                rates_snapshot=rates.get(ctx.ad.ad_id),
                 stats_snapshot=stats.get(ctx.ad.ad_id),
             )
         except Exception:
@@ -157,7 +146,6 @@ async def _decide_and_apply(
     session: AccountSession,
     database: Database,
     state: StateStore,
-    rates_snapshot: dict | None,
     stats_snapshot: dict | None,
 ) -> str | None:
     """Один decide → (опц. fetch_bids → recompute) → apply."""
@@ -167,7 +155,6 @@ async def _decide_and_apply(
     base_input = DecisionInput(
         ctx=ctx,
         now=now,
-        rates_snapshot=_extract_manual_rate(rates_snapshot),
         stats_snapshot=stats_snapshot,
         bids_info=None,
         last_set_at=last_set_at,
@@ -194,21 +181,6 @@ async def _decide_and_apply(
         state=state,
         now=now,
     )
-
-
-def _extract_manual_rate(item_payload: dict | None) -> dict | None:
-    """Из item-payload `getPromotionsByItemIds` вытаскивает manual блок.
-
-    Avito возвращает на каждый item: {"itemId", "actionTypeID",
-    "manual": {"bidPenny", "limitPenny", ...}, "auto": {...}, ...}.
-    Decision engine ожидает плоский dict с bidPenny/limitPenny.
-    """
-    if not isinstance(item_payload, dict):
-        return None
-    manual = item_payload.get("manual")
-    if isinstance(manual, dict):
-        return manual
-    return item_payload
 
 
 async def _bulk_set_log(

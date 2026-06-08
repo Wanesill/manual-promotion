@@ -2,7 +2,7 @@
 
 Лимиты заданы Avito CPxPromo API:
 - set_manual_bid: 20/мин/аккаунт
-- get_bids / get_actual_rates: 20/мин/аккаунт (раздельные пулы)
+- get_bids: 20/мин/аккаунт
 - remove_cpxpromo: 300/мин/аккаунт
 
 Реализация: deque монотонных timestamps под per-key asyncio.Lock.
@@ -28,14 +28,12 @@ class Endpoint(StrEnum):
     SET_BID = "set_bid"
     GET_BIDS = "get_bids"
     REMOVE = "remove"
-    BATCH_RATES = "batch_rates"
 
 
 LIMITS_PER_MIN: Final[dict[Endpoint, int]] = {
     Endpoint.SET_BID: 20,
     Endpoint.GET_BIDS: 20,
     Endpoint.REMOVE: 300,
-    Endpoint.BATCH_RATES: 20,
 }
 
 WINDOW_S: Final[float] = 60.0
