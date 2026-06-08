@@ -17,8 +17,10 @@
     4. между объявлениями проверяем `stop_event` — это точка корректного
        выхода и для shutdown'а, и для cancel'а отвалившегося аккаунта.
 
-`MAX_CYCLE_TIMEOUT_MULTIPLIER` нет — цикл аккаунта может занять часы, и
-это нормально (5000 ad * 20/мин get_bids ≈ 4 ч).
+Хард-таймаута на итерацию через `asyncio.wait_for` нет — цикл аккаунта
+может занять часы (5000 ad × 20/мин get_bids ≈ 4 ч). Но есть soft-cap
+`MAX_ITERATION_S` (6 ч), проверяется между ad'ами — если итерация затянулась
+сверх него, корректно выходим, в следующей итерации стартуем заново.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CYCLE_INTERVAL_S",
+    "MAX_ITERATION_S",
     "STATS_REFRESH_INTERVAL_S",
     "run_dispatcher",
 ]
@@ -67,6 +70,12 @@ CYCLE_INTERVAL_S: Final[int] = 300
 
 STATS_REFRESH_INTERVAL_S: Final[int] = 300
 """Перечитывать stats + now внутри одной итерации account_loop не реже этого."""
+
+MAX_ITERATION_S: Final[int] = 6 * 60 * 60
+"""Soft-лимит одной итерации account_cycle. Проверяется на границе ad'а;
+сетевой вызов не рвём. По истечении — выходим из прохода, в следующей
+итерации начинаем заново (свежий load_account_promotions, заново
+получаем токен если истёк, и т.д.)."""
 
 
 @dataclass
@@ -168,6 +177,7 @@ async def _account_loop(
     while not stop_event.is_set() and not worker_stop.is_set():
         iteration += 1
         iter_start = time.monotonic()
+        iter_deadline = iter_start + MAX_ITERATION_S
         try:
             done, session = await _account_cycle(
                 account_id=account_id,
@@ -176,6 +186,7 @@ async def _account_loop(
                 stop_event=stop_event,
                 worker_stop=worker_stop,
                 session=session,
+                iter_deadline=iter_deadline,
             )
         except Exception:
             logger.exception(
@@ -205,12 +216,15 @@ async def _account_cycle(
     stop_event: asyncio.Event,
     worker_stop: asyncio.Event,
     session: AccountSession | None,
+    iter_deadline: float,
 ) -> tuple[bool, AccountSession | None]:
     """Одна итерация цикла. Возвращает (done, session).
 
     `done=True` — у аккаунта не осталось активных promotion'ов
     (load_account_promotions вернул None), воркер завершается.
     `session` — пробрасывается дальше, чтобы in-memory токен пережил итерацию.
+    `iter_deadline` — `time.monotonic()` после которого прерываем обход на
+    границе ad'а (см. MAX_ITERATION_S).
     """
     snapshot = await database.load_account_promotions(account_id)
     if snapshot is None:
@@ -240,6 +254,13 @@ async def _account_cycle(
 
     for ctx in contexts:
         if stop_event.is_set() or worker_stop.is_set():
+            return False, session
+        if time.monotonic() >= iter_deadline:
+            logger.warning(
+                "account {} итерация превысила {}с — прерываем на границе ad'а",
+                account_id,
+                MAX_ITERATION_S,
+            )
             return False, session
         if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
             try:

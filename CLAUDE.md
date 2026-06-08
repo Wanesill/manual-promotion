@@ -25,8 +25,11 @@ Critical constraints baked into the design:
 - **Per-account workers**, not one global cycle. A supervisor task
   refreshes the active-account list every 5 min and spawns / stops
   per-account workers. One worker = one account; an iteration may take
-  4+ hours (5000 ads × 20/min `get_bids` limit) — there is no hard
-  per-iteration timeout.
+  4+ hours (5000 ads × 20/min `get_bids` limit). There is no hard
+  `asyncio.wait_for` timeout — instead a **soft cap `MAX_ITERATION_S`
+  (6 h)** is checked between ads: if the iteration ran past the deadline
+  we break the per-ad loop and start fresh next iteration. A single
+  in-flight network call is never torn down mid-flight.
 - **Single instance** — no sharding, no leader election.
 - **Schema is owned by the parent service** — we only read from it and write
   to whitelisted columns (`log_message`, `critical_min_bid`,
