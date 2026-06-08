@@ -62,8 +62,8 @@ app/
 ├── infra/
 │   └── redis_cache.py           AvitoCache — Redis + cachetools fallback
 └── dispatcher/
-    ├── process_dispatcher.py    run_dispatcher: supervisor + per-account workers
-    ├── account_session.py       wraps AvitoService (token resolution + bids cache)
+    ├── process_dispatcher.py    run_dispatcher: supervisor + per-account workers,
+    │                              inline token resolution (_resolve_avito)
     ├── critical_bids.py         parse_critical_bids, pick_compare_percent
     ├── decision_engine.py       compute_target_state — pure function, 17 stages
     └── apply_decision.py        only mutating layer (calls Avito + writes DB rows)
@@ -124,18 +124,16 @@ schedule data. Drift detection uses `ctx.last_log.bid` (no
 
 The DAL does **not** mutate `Account` rows. Tokens (`access_token`,
 `expires_in`) are read-only here — refreshing a stale token in DB remains
-the parent API's job. Token resolution priority in
-`AccountSession.ensure_token`:
-(a) a valid `Account.access_token` from DB;
-(b) an in-memory token obtained earlier in this same worker via
-`authenticate(client_id, client_secret)`;
-(c) a fresh `authenticate` call, if `client_id` / `client_secret` are
-present.
-A token obtained via (c) is **not persisted** to DB — it lives in the
-`AccountSession` for the worker's lifetime; when the supervisor restarts
-the worker, `authenticate` is dialled again. If none of (a)/(b)/(c)
-produce a token: `LOG_DISABLED_BY_TOKEN_EXPIRED` (no credentials) or
-`LOG_DISABLED_BY_AUTH_FAILED` (Avito rejected).
+the parent API's job. Token resolution happens inline at the start of
+each iteration in `_resolve_avito(account)`:
+(a) if `Account.access_token` is present and `expires_in − now >=
+TOKEN_REFRESH_THRESHOLD_S` (1 h), build `AvitoService` with it;
+(b) otherwise call `AvitoService.authenticate(client_id, client_secret)`
+and build `AvitoService` with the returned token.
+The freshly fetched token is **not persisted** to DB and not cached
+between iterations — the next iteration repeats (a)/(b). If credentials
+are absent → `LOG_DISABLED_BY_TOKEN_EXPIRED`; if `authenticate` fails or
+returns junk → `LOG_DISABLED_BY_AUTH_FAILED`.
 
 ## Decision engine contract
 
@@ -213,12 +211,12 @@ There is no proactive rate limiter: on 429/5xx `AvitoService` waits per
 sequential (`asyncio.gather` only fans out across accounts), so no
 uncontrolled burst.
 
-The OAuth `authenticate` endpoint (`POST /token`) is called **only** for
-first-time token acquisition — when DB has no valid `access_token` but the
-account carries `client_id` / `client_secret`. The result lives in
-`AccountSession` memory only; we do not write it to
-`Account.access_token`. Refreshing a stale token in DB remains the parent
-API's job.
+The OAuth `authenticate` endpoint (`POST /token`) is called by
+`_resolve_avito` at the start of each iteration when the DB token is
+missing or expiring within `TOKEN_REFRESH_THRESHOLD_S` (1 h). The result
+is used to build the per-iteration `AvitoService` only — we do not write
+it to `Account.access_token` and we do not cache it between iterations.
+Refreshing a stale token in DB remains the parent API's job.
 
 The batch `getPromotionsByItemIds` endpoint is **not** called either —
 drift ("did we already send this bid?") is detected against the last row

@@ -9,12 +9,16 @@
 - account_loop(account_id) — независимый бесконечный цикл одного аккаунта.
   На каждой итерации:
     1. load_account_promotions → если уже пусто, выходим (supervisor поймёт);
-    2. ensure_token; снимок stats; обрабатываем объявления последовательно;
-    3. внутри прохода каждые `STATS_REFRESH_INTERVAL_S` (5 мин) дозагружаем
+    2. inline token resolution: либо валидный access_token из БД
+       (с запасом >= 1 ч), либо `AvitoService.authenticate` по
+       client_id/secret; иначе пишем LOG_DISABLED_BY_TOKEN_EXPIRED /
+       LOG_DISABLED_BY_AUTH_FAILED и заканчиваем итерацию;
+    3. снимок stats; обрабатываем объявления последовательно;
+    4. внутри прохода каждые `STATS_REFRESH_INTERVAL_S` (5 мин) дозагружаем
        свежие stats + `now`, потому что на 5000 объявлений с лимитом
        20/мин на get_bids цикл может длиться часами и бюджет успеет
        протечь;
-    4. между объявлениями проверяем `stop_event` — это точка корректного
+    5. между объявлениями проверяем `stop_event` — это точка корректного
        выхода и для shutdown'а, и для cancel'а отвалившегося аккаунта.
 
 Хард-таймаута на итерацию через `asyncio.wait_for` нет — цикл аккаунта
@@ -33,10 +37,7 @@ from typing import TYPE_CHECKING, Final
 
 from loguru import logger
 
-from app.dispatcher.account_session import (
-    AccountSession,
-    AccountTokenError,
-)
+from app.database.models import Account
 from app.dispatcher.apply_decision import apply_decision
 from app.dispatcher.decision_engine import (
     Action,
@@ -45,10 +46,14 @@ from app.dispatcher.decision_engine import (
     compute_target_state,
     recompute_with_bids,
 )
-from app.external_services.avito_service import AccountForbiddenError
+from app.external_services.avito_service import (
+    AccountForbiddenError,
+    AvitoService,
+)
 from app.log_messages import (
     LOG_DISABLED_BY_ACCOUNT_DELETED,
     LOG_DISABLED_BY_AUTH_FAILED,
+    LOG_DISABLED_BY_TOKEN_EXPIRED,
 )
 
 if TYPE_CHECKING:
@@ -62,6 +67,7 @@ __all__ = [
     "CYCLE_INTERVAL_S",
     "MAX_ITERATION_S",
     "STATS_REFRESH_INTERVAL_S",
+    "TOKEN_REFRESH_THRESHOLD_S",
     "run_dispatcher",
 ]
 
@@ -76,6 +82,11 @@ MAX_ITERATION_S: Final[int] = 6 * 60 * 60
 сетевой вызов не рвём. По истечении — выходим из прохода, в следующей
 итерации начинаем заново (свежий load_account_promotions, заново
 получаем токен если истёк, и т.д.)."""
+
+TOKEN_REFRESH_THRESHOLD_S: Final[int] = 60 * 60
+"""DB-токен считается невалидным, если до expires_in осталось < этого
+значения. На каждой итерации проверяем — если порог нарушен, дёргаем
+AvitoService.authenticate (in-memory only, в БД не пишем)."""
 
 
 @dataclass
@@ -167,25 +178,23 @@ async def _account_loop(
 ) -> None:
     """Бесконечный цикл одного аккаунта.
 
-    `session` живёт на всю жизнь воркера — это нужно, чтобы in-memory токен
-    от `authenticate` сохранялся между итерациями. Если воркер крашится и
-    supervisor перезапускает его — у нового экземпляра `session=None`,
-    и `authenticate` дёрнется заново (это и есть «refresh через restart»).
+    Никакого долгоживущего state между итерациями нет: каждая итерация
+    заново загружает Account + promotions, перепроверяет токен из БД
+    или дёргает authenticate, строит AvitoService локально и работает с
+    ним до конца прохода.
     """
     iteration = 0
-    session: AccountSession | None = None
     while not stop_event.is_set() and not worker_stop.is_set():
         iteration += 1
         iter_start = time.monotonic()
         iter_deadline = iter_start + MAX_ITERATION_S
         try:
-            done, session = await _account_cycle(
+            done = await _account_cycle(
                 account_id=account_id,
                 database=database,
                 cache=cache,
                 stop_event=stop_event,
                 worker_stop=worker_stop,
-                session=session,
                 iter_deadline=iter_deadline,
             )
         except Exception:
@@ -215,56 +224,57 @@ async def _account_cycle(
     cache: AvitoCache,
     stop_event: asyncio.Event,
     worker_stop: asyncio.Event,
-    session: AccountSession | None,
     iter_deadline: float,
-) -> tuple[bool, AccountSession | None]:
-    """Одна итерация цикла. Возвращает (done, session).
+) -> bool:
+    """Одна итерация цикла. Возвращает True, если воркер должен завершиться.
 
     `done=True` — у аккаунта не осталось активных promotion'ов
-    (load_account_promotions вернул None), воркер завершается.
-    `session` — пробрасывается дальше, чтобы in-memory токен пережил итерацию.
+    (load_account_promotions вернул None), supervisor подберёт.
     `iter_deadline` — `time.monotonic()` после которого прерываем обход на
     границе ad'а (см. MAX_ITERATION_S).
     """
     snapshot = await database.load_account_promotions(account_id)
     if snapshot is None:
-        return True, session
+        return True
     account, contexts, profile_active_count = snapshot
 
-    if session is None:
-        session = AccountSession(account=account, cache=cache)
-    else:
-        session.update_account(account)
-
+    # 1. Состояние аккаунта.
     if account.status == "deleted":
         await _bulk_set_log(
             database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED
         )
-        return False, session
+        return False
 
-    try:
-        await session.ensure_token()
-    except AccountTokenError as err:
-        await _bulk_set_log(database, contexts, err.log_message)
-        return False, session
+    # 2. Авторизация — inline, без долгоживущего state.
+    avito = await _resolve_avito(account)
+    if avito is None:
+        # _resolve_avito уже залогировал причину; решаем какой log_message
+        # выставить ads, по наличию credentials.
+        auth_fail_msg = (
+            LOG_DISABLED_BY_TOKEN_EXPIRED
+            if not account.client_id or not account.client_secret
+            else LOG_DISABLED_BY_AUTH_FAILED
+        )
+        await _bulk_set_log(database, contexts, auth_fail_msg)
+        return False
 
-    stats = await session.fetch_stats_today(database)
+    stats = await database.load_today_stats(account_id=account.id)
     stats_at = time.monotonic()
     now = datetime.now()
 
     for ctx in contexts:
         if stop_event.is_set() or worker_stop.is_set():
-            return False, session
+            return False
         if time.monotonic() >= iter_deadline:
             logger.warning(
                 "account {} итерация превысила {}с — прерываем на границе ad'а",
                 account_id,
                 MAX_ITERATION_S,
             )
-            return False, session
+            return False
         if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
             try:
-                stats = await session.fetch_stats_today(database)
+                stats = await database.load_today_stats(account_id=account.id)
             except Exception:
                 logger.exception("account {} refresh stats упал", account_id)
             else:
@@ -274,7 +284,8 @@ async def _account_cycle(
             log_message = await _decide_and_apply(
                 ctx=ctx,
                 now=now,
-                session=session,
+                avito=avito,
+                cache=cache,
                 database=database,
                 stats_snapshot=stats.get(ctx.ad.ad_id),
                 profile_active_count=profile_active_count,
@@ -290,13 +301,70 @@ async def _account_cycle(
                 [(ctx.promotion.id, log_message)]
             )
             ctx.promotion.log_message = log_message
-    return False, session
+    return False
+
+
+async def _resolve_avito(account: Account) -> AvitoService | None:
+    """Строит AvitoService на текущий цикл; None — нет рабочего токена.
+
+    Приоритет:
+    - `Account.access_token` из БД, если `expires_in - now >=
+      TOKEN_REFRESH_THRESHOLD_S` (с запасом, чтобы не оказаться с
+      «протухшим» токеном к концу 4-часовой итерации);
+    - иначе `AvitoService.authenticate(client_id, client_secret)`. Результат
+      **в БД не сохраняем** — refresh устаревшего токена в Account это
+      задача родительского сервиса.
+    """
+    has_db_token = (
+        account.access_token
+        and account.expires_in is not None
+        and (account.expires_in - datetime.now()).total_seconds()
+        >= TOKEN_REFRESH_THRESHOLD_S
+    )
+    if has_db_token:
+        return AvitoService(
+            user_id=account.user_id,
+            token=account.access_token,  # type: ignore[arg-type]
+        )
+
+    if not account.client_id or not account.client_secret:
+        logger.warning(
+            "account {}: токен истёк, нет client creds для переавторизации",
+            account.user_id,
+        )
+        return None
+
+    try:
+        token_data = await AvitoService.authenticate(
+            client_id=account.client_id,
+            client_secret=account.client_secret,
+        )
+    except Exception:
+        logger.exception("account {}: authenticate упал", account.user_id)
+        return None
+
+    if (
+        not isinstance(token_data, dict)
+        or "error" in token_data
+        or not token_data.get("access_token")
+    ):
+        logger.error(
+            "account {}: authenticate вернул мусор: {}",
+            account.user_id,
+            token_data,
+        )
+        return None
+
+    return AvitoService(
+        user_id=account.user_id, token=token_data["access_token"]
+    )
 
 
 async def _decide_and_apply(
     ctx: PromotionContext,
     now: datetime,
-    session: AccountSession,
+    avito: AvitoService,
+    cache: AvitoCache,
     database: Database,
     stats_snapshot: dict | None,
     profile_active_count: int,
@@ -313,7 +381,7 @@ async def _decide_and_apply(
 
     if decision.action == Action.FETCH_BIDS:
         try:
-            bids_info = await session.fetch_bids(ctx.ad.ad_id)
+            bids_info = await _fetch_bids_cached(avito, cache, ctx.ad.ad_id)
         except AccountForbiddenError:
             return LOG_DISABLED_BY_AUTH_FAILED
         if bids_info is None:
@@ -325,10 +393,23 @@ async def _decide_and_apply(
     return await apply_decision(
         decision=decision,
         ctx=ctx,
-        session=session,
+        avito=avito,
+        cache=cache,
         database=database,
         now=now,
     )
+
+
+async def _fetch_bids_cached(
+    avito: AvitoService, cache: AvitoCache, ad_id: int
+) -> dict | None:
+    """get_bids(ad_id) через `AvitoCache.get_or_set_bids` (Redis TTL 1ч)."""
+
+    async def _fetch() -> dict | None:
+        result = await avito.get_bids(ad_id=ad_id)
+        return result or None
+
+    return await cache.get_or_set_bids(ad_id, _fetch)
 
 
 async def _bulk_set_log(

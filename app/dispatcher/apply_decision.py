@@ -16,7 +16,8 @@ from app.log_messages import (
 
 if TYPE_CHECKING:
     from app.database.database import Database, PromotionContext
-    from app.dispatcher.account_session import AccountSession
+    from app.external_services.avito_service import AvitoService
+    from app.infra.redis_cache import AvitoCache
 
 __all__ = ["apply_decision"]
 
@@ -24,7 +25,8 @@ __all__ = ["apply_decision"]
 async def apply_decision(
     decision: Decision,
     ctx: PromotionContext,
-    session: AccountSession,
+    avito: AvitoService,
+    cache: AvitoCache,
     database: Database,
     now: datetime,
 ) -> str | None:
@@ -45,23 +47,23 @@ async def apply_decision(
     # 2. сетевой вызов
     if decision.action == Action.SET_BID:
         try:
-            result = await session.set_manual_bid(
+            result = await avito.set_manual_bid(
                 ad_id=ctx.ad.ad_id,
-                bid=decision.bid_penny,  # type: ignore[arg-type]
+                bid=decision.bid_penny,
                 limit_penny=decision.limit_penny,
             )
         except AccountForbiddenError:
             log_message = LOG_DISABLED_BY_AUTH_FAILED
-            await session.invalidate_caches_for_ad(ctx.ad.ad_id)
+            await cache.invalidate_bids(ctx.ad.ad_id)
             return log_message
         if result:
-            await session.invalidate_caches_for_ad(ctx.ad.ad_id)
+            await cache.invalidate_bids(ctx.ad.ad_id)
         elif result is None:
             # Avito отверг ставку (400) — наши critical_* протухли.
             # Сбрасываем bids-кэш в Redis и обнуляем critical_* в БД,
             # чтобы decision_engine next-итерацией ушёл в FETCH_BIDS
             # и upsert_critical перепишет свежие границы.
-            await session.invalidate_caches_for_ad(ctx.ad.ad_id)
+            await cache.invalidate_bids(ctx.ad.ad_id)
             await database.reset_critical(ctx.promotion.id)
             log_message = LOG_BID_CHANGE_FAILED
         else:
@@ -69,7 +71,7 @@ async def apply_decision(
 
     elif decision.action == Action.REMOVE:
         try:
-            await session.remove_cpxpromo(ad_id=ctx.ad.ad_id)
+            await avito.remove_cpxpromo(ad_id=ctx.ad.ad_id)
         except AccountForbiddenError:
             log_message = LOG_DISABLED_BY_AUTH_FAILED
             return log_message
