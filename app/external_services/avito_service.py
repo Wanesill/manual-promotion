@@ -7,6 +7,10 @@ HTTP 403 пробрасывается как AccountForbiddenError для caller
 
 Rate limits (per account) контролируются НЕ здесь, а в `AccountRateLimiter`
 (infra/rate_limiter.py) — вызывается caller'ом перед методом.
+
+Аутентификация (получение access_token по client_id/secret) НЕ выполняется
+этим сервисом — токен пишет родительский API. Здесь токен только читается
+из БД и используется как есть.
 """
 
 from __future__ import annotations
@@ -155,74 +159,6 @@ class AvitoService:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
-
-    # ---------- аутентификация ----------
-
-    @classmethod
-    async def authenticate(
-        cls,
-        client_id: str,
-        client_secret: str,
-    ) -> dict:
-        """Получает access_token через OAuth client_credentials grant.
-
-        Возвращает: {"access_token": str, "token_type": "Bearer",
-        "expires_in": int} либо {"error": "..."} при ошибке.
-        """
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "client_credentials",
-        }
-        session = await cls.get_session()
-
-        for attempt in range(5):
-            try:
-                async with session.post(
-                    url="https://api.avito.ru/token",
-                    data=data,
-                    headers=headers,
-                    timeout=cls.ten_minutes_timeout,
-                ) as response:
-                    if response.status in (429, 500, 503, 504):
-                        retry_after = int(
-                            response.headers.get("x-ratelimit-retry-after", "5")
-                        )
-                        logger.warning(
-                            "Авторизация Avito {}: ждём {}с",
-                            response.status,
-                            retry_after,
-                        )
-                        await asyncio.sleep(retry_after)
-                        continue
-                    if response.status >= 400:
-                        text = await response.text()
-                        logger.error(
-                            "Авторизация Avito неудачна {}: {}",
-                            response.status,
-                            text,
-                        )
-                        return {"error": text}
-                    return await response.json()
-            except (
-                TimeoutError,
-                ServerDisconnectedError,
-                ClientConnectorError,
-                ClientPayloadError,
-            ) as err:
-                logger.warning(
-                    "Авторизация Avito попытка {} ошибка {}: {}",
-                    attempt + 1,
-                    type(err).__name__,
-                    err,
-                )
-                if attempt < 4:
-                    await asyncio.sleep(2**attempt)
-                else:
-                    logger.exception("Авторизация Avito — финальный провал")
-                    return {"error": str(err)}
-        return {"error": "no_response"}
 
     # ---------- batch: текущие ставки ----------
 

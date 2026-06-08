@@ -94,8 +94,11 @@ account: one batch `getPromotionsByItemIds`, one `load_today_stats`
   `critical_max_limit`, `disabled_bid` after a `get_bids` fetch.
 - `bulk_update_log_message(updates)` — single statement at the end of each
   account batch.
-- `update_account_token(account_id, access_token, expires_in)`,
-  `mark_account_expired(account_id)` — auth side-effects.
+
+The DAL does **not** mutate `Account` rows. Tokens (`access_token`,
+`expires_in`) are read-only here — refresh is the parent service's
+responsibility. If `expires_in <= now()` we log `LOG_DISABLED_BY_TOKEN_EXPIRED`
+and skip the account for this cycle.
 
 ## Decision engine contract
 
@@ -147,7 +150,9 @@ side.
 | `get_bids` (per ad)               | 20/min/account    | `mp:bids:{ad_id}` 3600s                      |
 | `set_manual_bid`                  | 20/min/account    | — (invalidates rates)                        |
 | `remove_cpxpromo`                 | 300/min/account   | —                                            |
-| `authenticate`                    | n/a               | `mp:token:{account_id}` `expires_in−300s`    |
+
+The OAuth `authenticate` endpoint is **not** called from this service —
+token refresh is owned by the parent API.
 
 Statistics (`ad_detail_statistic`) are **not** cached in Redis — they're
 read from PostgreSQL every cycle (cheap; the parent service maintains the

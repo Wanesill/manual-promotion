@@ -3,7 +3,9 @@
 Ключи:
 - mp:rates:{account_id}   TTL 300
 - mp:bids:{ad_id}         TTL 3600
-- mp:token:{account_id}   TTL = expires_in-now-300
+
+Токены аккаунтов НЕ кэшируем — читаем их напрямую из БД (Account.access_token),
+refresh выполняет родительский сервис.
 
 Статистика (`ad_detail_statistic`) НЕ кэшируется здесь — читаем напрямую
 из БД каждый цикл (5 мин), родительский сервис её ведёт.
@@ -18,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime
 from typing import Final
 
 import orjson
@@ -31,7 +32,6 @@ __all__ = ["AvitoCache"]
 
 RATES_TTL_S: Final[int] = 300
 BIDS_TTL_S: Final[int] = 3600
-TOKEN_SAFETY_MARGIN_S: Final[int] = 300
 NAMESPACE: Final[str] = "mp"
 
 
@@ -42,7 +42,6 @@ class AvitoCache:
         self._redis = redis
         self._rates_local: TTLCache = TTLCache(maxsize=10_000, ttl=RATES_TTL_S)
         self._bids_local: TTLCache = TTLCache(maxsize=100_000, ttl=BIDS_TTL_S)
-        self._token_local: TTLCache = TTLCache(maxsize=10_000, ttl=3600)
         self._key_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
 
@@ -162,31 +161,3 @@ class AvitoCache:
         key = self._bids_key(ad_id)
         await self._redis_del(key)
         self._bids_local.pop(key, None)
-
-    # ---------- token ----------
-
-    @staticmethod
-    def _token_key(account_id: int) -> str:
-        return f"{NAMESPACE}:token:{account_id}"
-
-    async def get_token(self, account_id: int) -> tuple[str, datetime] | None:
-        key = self._token_key(account_id)
-        cached = await self._redis_get(key)
-        if cached is None and key in self._token_local:
-            cached = self._token_local[key]
-        if not isinstance(cached, dict):
-            return None
-        try:
-            return cached["token"], datetime.fromisoformat(cached["expires_in"])
-        except (KeyError, ValueError):
-            return None
-
-    async def set_token(
-        self, account_id: int, token: str, expires_in: datetime
-    ) -> None:
-        key = self._token_key(account_id)
-        ttl = int((expires_in - datetime.now()).total_seconds() - TOKEN_SAFETY_MARGIN_S)
-        value = {"token": token, "expires_in": expires_in.isoformat()}
-        if ttl > 0:
-            await self._redis_setex(key, ttl, value)
-            self._token_local[key] = value

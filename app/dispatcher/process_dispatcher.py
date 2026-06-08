@@ -113,7 +113,7 @@ async def _process_account(
 
     session = AccountSession(account=account, rate_limiter=rate_limiter, cache=cache)
     try:
-        await session.ensure_token(database)
+        await session.ensure_token()
     except AccountTokenError as err:
         await _bulk_set_log(database, contexts, err.log_message, state)
         return

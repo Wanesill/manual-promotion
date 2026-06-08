@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import TYPE_CHECKING
 
-from loguru import logger
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
@@ -271,34 +270,4 @@ class Database:
                     .where(ManualPromotion.id == promotion_id)
                     .values(log_message=message)
                 )
-            await session.commit()
-
-    async def update_account_token(
-        self,
-        account_id: int,
-        access_token: str,
-        expires_in: datetime,
-    ) -> None:
-        async with self._sessionmaker() as session:
-            await session.execute(
-                update(Account)
-                .where(Account.id == account_id)
-                .values(
-                    access_token=access_token,
-                    expires_in=expires_in,
-                    status="active",
-                )
-            )
-            await session.commit()
-        logger.info(
-            "Аккаунт {} токен обновлён (expires_in={})",
-            account_id,
-            expires_in.isoformat(),
-        )
-
-    async def mark_account_expired(self, account_id: int) -> None:
-        async with self._sessionmaker() as session:
-            await session.execute(
-                update(Account).where(Account.id == account_id).values(status="expired")
-            )
             await session.commit()
