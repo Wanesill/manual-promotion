@@ -6,7 +6,7 @@ Caller (apply_decision) выполняет сетевые вызовы и зап
 Stages (порядок ранних выходов, повторён в коде compute_target_state):
 1. ad.status != active                    → NOOP   LOG_USER_DELETED
 2. promotion.bid IS NULL                  → NOOP   LOG_NOT_CONFIGURED
-3. profile / limit / end_date             → NOOP   LOG_DISABLED_BY_TARIFF
+3. profile / limit / overuse / end_date   → NOOP   LOG_DISABLED_BY_TARIFF
 4. critical_* в БД отсутствуют            → FETCH_BIDS
 5. parse_critical_bids -> None            → NOOP   LOG_PROMOTION_UNAVAILABLE
 6. !in_work_schedule                      → REMOVE LOG_DISABLED_BY_TIME
@@ -21,8 +21,9 @@ Stages (порядок ранних выходов, повторён в коде
 `bid` обязателен; ставку за пределами critical_min_bid / critical_max_bid
 не зажимаем — возвращаем NOOP с ошибочным log_message.
 `daily_budget` опционален: если None → limitPenny в Avito не отправляем,
-бюджет не проверяем. Если задан и вышел за critical_min_limit /
-critical_max_limit — зажимаем до критического, округляя до рубля.
+бюджет не проверяем. Если задан — `_round_to_ruble_within_critical`
+делает half-up округление до рубля и зажимает в [critical_min_limit,
+critical_max_limit] (границы тоже подгоняем к рублю — min вверх, max вниз).
 
 При write_log=True И bids_info is None → FETCH_BIDS (нужны bids
 для compare_percent). После recompute_with_bids решение финализируется.
@@ -59,7 +60,6 @@ from app.log_messages import (
     LOG_USER_DELETED,
     SOFT_DISABLED_LOGS,
 )
-from app.utils.time_utils import is_in_work_schedule
 
 __all__ = [
     "Action",
@@ -71,6 +71,10 @@ __all__ = [
 
 COOLDOWN: timedelta = timedelta(hours=1)
 HOURLY_LOG_INTERVAL: timedelta = timedelta(hours=1)
+
+# В Avito API можно слать произвольную кратность, но мы держим внешнюю
+# семантику «всё в целых рублях» — limit/bid округляются до 100 коп.
+BID_ROUND_STEP: int = 100
 
 
 class Action(StrEnum):
@@ -99,6 +103,7 @@ class DecisionInput:
     now: datetime
     stats_snapshot: dict | None
     bids_info: dict | None
+    profile_active_count: int
 
 
 # ---------- helpers ----------
@@ -142,23 +147,46 @@ def _bounds_from_promotion(
     )
 
 
-def _clamp_limit(daily_budget: int | None, bounds: CriticalBidsData) -> int | None:
-    """Лимит для set_manual_bid с округлением до рубля при clamp'е.
+def _round_to_ruble_within_critical(
+    value: int,
+    critical_min: int | None,
+    critical_max: int | None,
+) -> int:
+    """Округляет копейки до целого рубля, оставаясь в critical-границах.
 
-    - `daily_budget is None` → None: limitPenny в Avito не отправляем.
-    - daily_budget < critical_min_limit → ceil(min/100)*100 (вверх до рубля,
-      чтобы попасть >= min).
-    - daily_budget > critical_max_limit → floor(max/100)*100 (вниз до рубля,
-      чтобы попасть <= max).
-    - daily_budget внутри границ → отдаём как есть.
+    Avito принимает `bidPenny`/`limitPenny` любой кратности, но мы
+    отправляем только целые рубли (кратные 100 коп). Округление —
+    half-up: 15.3 → 15, 15.5 → 16, 100.5 → 101 (Python's `round()`
+    использовал бы banker's и выдал 100 для 100.5, что контринтуитивно).
+
+    Если округлённое значение выпадает за `[critical_min, critical_max]`
+    (critical приходят из getBids с safety-margin ±100 коп и могут быть
+    не кратны 100), граница «загибается» внутрь: для нижней — ceil к
+    ближайшему рублю, для верхней — floor, чтобы итог гарантированно
+    лежал в платформенных пределах Avito.
     """
+    half = BID_ROUND_STEP // 2
+    rounded = (value + half) // BID_ROUND_STEP * BID_ROUND_STEP
+    if critical_min is not None:
+        ruble_min = -(-critical_min // BID_ROUND_STEP) * BID_ROUND_STEP
+        rounded = max(rounded, ruble_min)
+    if critical_max is not None:
+        ruble_max = (critical_max // BID_ROUND_STEP) * BID_ROUND_STEP
+        rounded = min(rounded, ruble_max)
+    return rounded
+
+
+def _clamp_limit(
+    daily_budget: int | None, bounds: CriticalBidsData
+) -> int | None:
+    """Лимит для set_manual_bid: half-up до рубля + clamp в critical."""
     if daily_budget is None:
         return None
-    if daily_budget < bounds.critical_min_limit:
-        return ((bounds.critical_min_limit + 99) // 100) * 100
-    if daily_budget > bounds.critical_max_limit:
-        return (bounds.critical_max_limit // 100) * 100
-    return daily_budget
+    return _round_to_ruble_within_critical(
+        daily_budget,
+        critical_min=bounds.critical_min_limit,
+        critical_max=bounds.critical_max_limit,
+    )
 
 
 def _system_note_text(
@@ -209,11 +237,15 @@ def _early_validation(
                 LOG_NOT_CONFIGURED, inp.ctx.promotion.log_message
             ),
         )
-    # 3. tariff
+    # 3. tariff — лимит, дата истечения и проверка фактического overuse
+    # (на случай гонки с родительским API: если в БД оказалось активных
+    # promotion'ов больше, чем разрешает manual_promotion_limit, считаем
+    # тариф нерабочим для всего аккаунта).
     today = inp.now.date()
     if (
         ctx.profile is None
         or ctx.profile.manual_promotion_limit <= 0
+        or inp.profile_active_count > ctx.profile.manual_promotion_limit
         or ctx.profile.manual_promotion_end_date is None
         or ctx.profile.manual_promotion_end_date < today
     ):
@@ -234,8 +266,14 @@ def _disable_by_schedule_or_metrics(
     inp: DecisionInput, bounds: CriticalBidsData
 ) -> Decision | None:
     p = inp.ctx.promotion
-    # 7. schedule
-    if not is_in_work_schedule(inp.now, p.work_days, p.work_hours_mask):
+    # 7. schedule. work_days — строка вида "Пн,Вт,Ср,..." (см. модель
+    # ManualPromotion). strftime("%a") даёт русскую аббревиатуру при
+    # LC_TIME=ru_RU.UTF-8 — locale выставляется в __main__.setup_logging.
+    hour = inp.now.hour
+    if (
+        inp.now.strftime("%a") not in p.work_days
+        or not (p.work_hours_mask >> hour) & 1
+    ):
         return _build_disable(inp, bounds, LOG_DISABLED_BY_TIME)
     stats = inp.stats_snapshot or {}
     spending = _spending_penny(stats)
@@ -247,7 +285,10 @@ def _disable_by_schedule_or_metrics(
     if p.daily_budget is not None and spending >= p.daily_budget:
         return _build_disable(inp, bounds, LOG_DISABLED_BY_BUDGET)
     # 9. impressions
-    if p.disable_impressions_limit and impressions >= p.disable_impressions_limit:
+    if (
+        p.disable_impressions_limit
+        and impressions >= p.disable_impressions_limit
+    ):
         return _build_disable(inp, bounds, LOG_DISABLED_BY_IMPRESSIONS)
     # 10. views
     if p.disable_views_limit and views >= p.disable_views_limit:
@@ -288,7 +329,9 @@ def _build_disable(
         compare_percent=compare,
         write_log=write_log,
         log_bid=bounds.disabled_bid,
-        write_system_note=_system_note_text(log_message, inp.ctx.promotion.log_message),
+        write_system_note=_system_note_text(
+            log_message, inp.ctx.promotion.log_message
+        ),
     )
 
 
@@ -400,7 +443,9 @@ def compute_target_state(inp: DecisionInput) -> Decision:
         compare_percent=compare,
         write_log=hourly_due,
         log_bid=bid,
-        write_system_note=_system_note_text(LOG_SUCCESS, inp.ctx.promotion.log_message),
+        write_system_note=_system_note_text(
+            LOG_SUCCESS, inp.ctx.promotion.log_message
+        ),
     )
 
 
@@ -424,7 +469,9 @@ def recompute_with_bids(
             Decision(
                 action=Action.NOOP,
                 log_message=msg,
-                write_system_note=_system_note_text(msg, inp.ctx.promotion.log_message),
+                write_system_note=_system_note_text(
+                    msg, inp.ctx.promotion.log_message
+                ),
             ),
             None,
         )
@@ -457,6 +504,7 @@ def recompute_with_bids(
         now=inp.now,
         stats_snapshot=inp.stats_snapshot,
         bids_info=bids_info,
+        profile_active_count=inp.profile_active_count,
     )
     decision = compute_target_state(new_inp)
     if update_payload is not None:

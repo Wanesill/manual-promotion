@@ -80,8 +80,14 @@ class AccountSession:
         now = datetime.now()
 
         # (a) валидный access_token в БД — всегда выигрывает.
-        if acc.access_token and acc.expires_in is not None and acc.expires_in > now:
-            self._avito = AvitoService(user_id=acc.user_id, token=acc.access_token)
+        if (
+            acc.access_token
+            and acc.expires_in is not None
+            and acc.expires_in > now
+        ):
+            self._avito = AvitoService(
+                user_id=acc.user_id, token=acc.access_token
+            )
             return
 
         # (b) живой in-memory токен от прошлой authenticate в этом воркере.
@@ -90,7 +96,9 @@ class AccountSession:
             and self._fetched_expires_at is not None
             and self._fetched_expires_at > now
         ):
-            self._avito = AvitoService(user_id=acc.user_id, token=self._fetched_token)
+            self._avito = AvitoService(
+                user_id=acc.user_id, token=self._fetched_token
+            )
             return
 
         # (c) пробуем authenticate, если есть чем.
@@ -109,7 +117,10 @@ class AccountSession:
             )
             raise AccountTokenError(LOG_DISABLED_BY_AUTH_FAILED) from err
 
-        if not isinstance(token_data, dict) or "access_token" not in token_data:
+        if (
+            not isinstance(token_data, dict)
+            or "access_token" not in token_data
+        ):
             logger.warning(
                 "Авторизация аккаунта {} вернула пустой payload: {}",
                 acc.user_id,

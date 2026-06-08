@@ -7,7 +7,9 @@ from typing import Final
 
 __all__ = ["sanitize_message"]
 
-BAD_CHARS_PATTERN: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1F\x7F-\x9F ⁦⁧⁨⁩]+")
+BAD_CHARS_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[\x00-\x1F\x7F-\x9F ⁦⁧⁨⁩]+"
+)
 MULTIPLE_SPACES_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s{2,}")
 DIGIT_SPACE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?<=\d) (?=\d)")
 

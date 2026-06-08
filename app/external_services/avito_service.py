@@ -198,7 +198,9 @@ class AvitoService:
                 ) as response:
                     if response.status in (429, 500, 503, 504):
                         retry_after = int(
-                            response.headers.get("x-ratelimit-retry-after", "5")
+                            response.headers.get(
+                                "x-ratelimit-retry-after", "5"
+                            )
                         )
                         await asyncio.sleep(retry_after)
                         continue
@@ -248,7 +250,11 @@ class AvitoService:
                 ) as response:
                     if response.status in (429, 500, 503, 504):
                         retry_after = (
-                            int(response.headers.get("x-ratelimit-retry-after", "5"))
+                            int(
+                                response.headers.get(
+                                    "x-ratelimit-retry-after", "5"
+                                )
+                            )
                             + 1
                         )
                         await asyncio.sleep(retry_after)
@@ -310,7 +316,9 @@ class AvitoService:
                 ) as response:
                     if response.status in (429, 500, 503, 504):
                         retry_after = int(
-                            response.headers.get("x-ratelimit-retry-after", "2")
+                            response.headers.get(
+                                "x-ratelimit-retry-after", "2"
+                            )
                         )
                         await asyncio.sleep(retry_after)
                         continue
@@ -363,7 +371,11 @@ class AvitoService:
                 ) as response:
                     if response.status in (429, 500, 503, 504):
                         retry_after = (
-                            int(response.headers.get("x-ratelimit-retry-after", "5"))
+                            int(
+                                response.headers.get(
+                                    "x-ratelimit-retry-after", "5"
+                                )
+                            )
                             + 1
                         )
                         await asyncio.sleep(retry_after)

@@ -127,7 +127,9 @@ async def _supervisor_tick(
     # 2. остановить воркеры неактивных аккаунтов (graceful, между ad'ами)
     for acc_id, worker in workers.items():
         if acc_id not in active_ids and not worker.stop.is_set():
-            logger.info("account {} больше не активен — останавливаем воркер", acc_id)
+            logger.info(
+                "account {} больше не активен — останавливаем воркер", acc_id
+            )
             worker.stop.set()
 
     # 3. поднять воркеры для новых активных аккаунтов
@@ -176,7 +178,9 @@ async def _account_loop(
                 session=session,
             )
         except Exception:
-            logger.exception("account {} итерация {} упала", account_id, iteration)
+            logger.exception(
+                "account {} итерация {} упала", account_id, iteration
+            )
             done = False
 
         elapsed = time.monotonic() - iter_start
@@ -211,7 +215,7 @@ async def _account_cycle(
     snapshot = await database.load_account_promotions(account_id)
     if snapshot is None:
         return True, session
-    account, contexts = snapshot
+    account, contexts, profile_active_count = snapshot
 
     if session is None:
         session = AccountSession(account=account, cache=cache)
@@ -219,7 +223,9 @@ async def _account_cycle(
         session.update_account(account)
 
     if account.status == "deleted":
-        await _bulk_set_log(database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED)
+        await _bulk_set_log(
+            database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED
+        )
         return False, session
 
     try:
@@ -250,12 +256,18 @@ async def _account_cycle(
                 session=session,
                 database=database,
                 stats_snapshot=stats.get(ctx.ad.ad_id),
+                profile_active_count=profile_active_count,
             )
         except Exception:
             logger.exception("Сбой обработки promotion={}", ctx.promotion.id)
             continue
-        if log_message is not None and log_message != ctx.promotion.log_message:
-            await database.bulk_update_log_message([(ctx.promotion.id, log_message)])
+        if (
+            log_message is not None
+            and log_message != ctx.promotion.log_message
+        ):
+            await database.bulk_update_log_message(
+                [(ctx.promotion.id, log_message)]
+            )
             ctx.promotion.log_message = log_message
     return False, session
 
@@ -266,6 +278,7 @@ async def _decide_and_apply(
     session: AccountSession,
     database: Database,
     stats_snapshot: dict | None,
+    profile_active_count: int,
 ) -> str | None:
     """Один decide → (опц. fetch_bids → recompute) → apply."""
     base_input = DecisionInput(
@@ -273,6 +286,7 @@ async def _decide_and_apply(
         now=now,
         stats_snapshot=stats_snapshot,
         bids_info=None,
+        profile_active_count=profile_active_count,
     )
     decision: Decision = compute_target_state(base_input)
 

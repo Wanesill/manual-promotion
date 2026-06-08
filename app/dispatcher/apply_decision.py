@@ -57,8 +57,12 @@ async def apply_decision(
         if result:
             await session.invalidate_caches_for_ad(ctx.ad.ad_id)
         elif result is None:
-            # Avito отверг ставку — границы устарели, сбросим bids-кэш
+            # Avito отверг ставку (400) — наши critical_* протухли.
+            # Сбрасываем bids-кэш в Redis и обнуляем critical_* в БД,
+            # чтобы decision_engine next-итерацией ушёл в FETCH_BIDS
+            # и upsert_critical перепишет свежие границы.
             await session.invalidate_caches_for_ad(ctx.ad.ad_id)
+            await database.reset_critical(ctx.promotion.id)
             log_message = LOG_BID_CHANGE_FAILED
         else:
             log_message = LOG_BID_CHANGE_FAILED
@@ -76,7 +80,10 @@ async def apply_decision(
     if decision.write_log and decision.log_bid is not None:
         # Если SET_BID не удался — лог не пишем (фактическая ставка
         # не изменилась). Логируем только подтверждённые состояния.
-        if decision.action == Action.SET_BID and log_message == LOG_BID_CHANGE_FAILED:
+        if (
+            decision.action == Action.SET_BID
+            and log_message == LOG_BID_CHANGE_FAILED
+        ):
             pass
         else:
             try:

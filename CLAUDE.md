@@ -16,15 +16,17 @@ Avito's state in sync with the rows the parent service writes.
 
 Critical constraints baked into the design:
 
-- **`set_manual_bid` runs at most once per hour per ad** (cooldown
-  считается по `ctx.last_log.timestamp`). Лимит проверяется per-account
-  каждый цикл, но для крупного аккаунта цикл сам может длиться часами
-  (см. ниже), и стейл-чек по бюджету мы лечим refresh'ом stats внутри
-  итерации каждые 5 мин.
-- **Per-account workers**, не один глобальный цикл. Supervisor каждые
-  5 мин перечитывает список активных аккаунтов и спавнит/останавливает
-  воркеры. Один воркер = один аккаунт, его итерация может занять
-  4+ ч (5000 ad × 20/мин get_bids), хард-таймаута на итерацию нет.
+- **`set_manual_bid` runs at most once per hour per ad.** Cooldown anchor
+  is `ctx.last_log.timestamp` (the latest row in `manual_promotion_log`).
+  Disable-conditions are re-evaluated each iteration. For large accounts
+  one iteration may itself take hours (see below), so we mitigate
+  stat-staleness by re-reading `load_today_stats` and `now` every
+  `STATS_REFRESH_INTERVAL_S` (5 min) inside the iteration.
+- **Per-account workers**, not one global cycle. A supervisor task
+  refreshes the active-account list every 5 min and spawns / stops
+  per-account workers. One worker = one account; an iteration may take
+  4+ hours (5000 ads × 20/min `get_bids` limit) — there is no hard
+  per-iteration timeout.
 - **Single instance** — no sharding, no leader election.
 - **Schema is owned by the parent service** — we only read from it and write
   to whitelisted columns (`log_message`, `critical_min_bid`,
@@ -46,8 +48,7 @@ app/
 ├── log_messages.py              Russian LOG_* constants — contract with the parent API
 ├── settings/config.py           Pydantic + YAML (APP_CONFIG env var) + lru_cache
 ├── utils/
-│   ├── logging_utils.py         sanitize_message (loguru patcher)
-│   └── time_utils.py            work-schedule helpers (WORK_DAY_NAMES, hour_is_active)
+│   └── logging_utils.py         sanitize_message (loguru patcher)
 ├── database/
 │   ├── database.py              DAL — see "Key DAL methods" below
 │   └── models/                  SQLAlchemy 2.0 mirror of parent's schema
@@ -59,64 +60,79 @@ app/
 │   └── redis_cache.py           AvitoCache — Redis + cachetools fallback
 └── dispatcher/
     ├── process_dispatcher.py    run_dispatcher: supervisor + per-account workers
-    ├── account_session.py       wraps AvitoService (token check + bids cache)
+    ├── account_session.py       wraps AvitoService (token resolution + bids cache)
     ├── critical_bids.py         parse_critical_bids, pick_compare_percent
-    ├── decision_engine.py       compute_target_state — pure function, 18 stages
+    ├── decision_engine.py       compute_target_state — pure function, 17 stages
     └── apply_decision.py        only mutating layer (calls Avito + writes DB rows)
 ```
 
 ## Cycle in one paragraph
 
-`run_dispatcher` запускает supervisor-таск: каждые `CYCLE_INTERVAL_S`
-(default 300) он вызывает `load_active_account_ids`, спавнит
-`_account_loop(account_id)` для новых, выставляет per-worker `stop` для
-отвалившихся (воркер выходит между объявлениями — сетевой вызов не рвём),
-и подбирает упавшие задачи (рестарт = на следующем тике supervisor'а).
-Один воркер аккаунта = бесконечный цикл с целевым интервалом
-`CYCLE_INTERVAL_S`. Внутри одной итерации: `load_account_promotions` →
-если нет активных promotion'ов, воркер выходит; иначе `ensure_token`,
-`load_today_stats`, затем sequentially per ad: `compute_target_state` →
-если нужны bid bounds, `fetch_bids` + recompute → `apply_decision`.
-Внутри прохода каждые `STATS_REFRESH_INTERVAL_S` (5 мин) дозагружаем
-`stats` + `now` — иначе на 4-часовом цикле бюджет/расписание сильно
-устарели бы. Drift детектится по `ctx.last_log.bid`. Проактивного
-rate-лимитера нет; на 429 `AvitoService` сам ждёт по
-`x-ratelimit-retry-after`.
+`run_dispatcher` runs a supervisor task: every `CYCLE_INTERVAL_S`
+(default 300) it calls `load_active_account_ids`, spawns
+`_account_loop(account_id)` for newly active ones, sets a per-worker `stop`
+event for accounts that are no longer active (the worker exits between
+ads — we never tear down a network call), and reaps crashed tasks (restart
+happens on the next supervisor tick). Each per-account worker is an
+infinite loop with target interval `CYCLE_INTERVAL_S`. One iteration:
+`load_account_promotions` → if no active promotions remain, the worker
+exits; otherwise `ensure_token`, `load_today_stats`, then sequentially
+per ad: `compute_target_state` → if bid bounds are needed, `fetch_bids` +
+`recompute_with_bids` → `apply_decision`. Inside the per-ad loop, every
+`STATS_REFRESH_INTERVAL_S` (5 min) we re-read `stats` and refresh `now` —
+without it a 4-hour iteration would carry hopelessly stale budget /
+schedule data. Drift detection uses `ctx.last_log.bid` (no
+`getPromotionsByItemIds` call). There is no proactive rate limiter: on
+429/5xx `AvitoService` honours `x-ratelimit-retry-after` and retries.
 
 ## Key DAL methods (`app/database/database.py`)
 
-- `load_active_account_ids()` — `DISTINCT ON` `ManualPromotion.account_id`
-  для активных строк. Используется supervisor'ом.
-- `load_account_promotions(account_id)` — снимок всех активных promotion'ов
-  одного аккаунта (с join'ом на `Account`/`Ad`/`Profile` и последним логом
-  на promotion). Возвращает None если активных нет — воркер аккаунта
-  выходит, supervisor подберёт.
+- `load_active_account_ids()` — `SELECT DISTINCT account_id` over rows with
+  `status IS TRUE AND deleted_at IS NULL`. Used by the supervisor.
+- `load_account_promotions(account_id)` — snapshot of all active
+  promotions of a single account (joined to `Account`/`Ad`/`Profile` and
+  with the latest `manual_promotion_log` row per promotion). Also returns
+  `profile_active_count` — total active promotions across **all** accounts
+  of the same `profile_id`, used by `decision_engine` to detect tariff
+  overuse. Returns `None` if no active rows remain — the worker exits and
+  the supervisor reaps it.
 - `load_today_stats(account_id, today=None)` — `DISTINCT ON (ad_id)` over
-  `ad_detail_statistic` rows since 00:00, ordered by `ad_id, timestamp DESC`,
-  joined with `Ad`. Возвращает накопленные сегодня
-  `views`, `contacts`, `impressions`, `presence_spending`, `promo_spending`,
-  `rest_spending` в формате `{avito_ad_id: {...camelCase keys for the
-  decision engine...}}`.
+  `ad_detail_statistic` rows since 00:00, ordered by
+  `ad_id, timestamp DESC`, joined with `Ad`. Returns the today-accumulated
+  `views`, `contacts`, `impressions`, `presence_spending`,
+  `promo_spending`, `rest_spending` shaped as
+  `{avito_ad_id: {...camelCase keys for the decision engine...}}`.
 - `insert_log(promotion_id, bid, compare_percent, timestamp)` — idempotent
   via `ON CONFLICT DO NOTHING` on `(promotion_id, timestamp)`.
 - `insert_system_note(promotion_id, text, created_at)` — system notes are
-  deduplicated by `StateStore.last_event` before this is called.
+  deduplicated by `decision_engine._system_note_text` against
+  `ManualPromotion.log_message` before this is called.
 - `upsert_critical(promotion_id, CriticalUpdate)` — writes
   `critical_min_bid`, `critical_max_bid`, `critical_min_limit`,
   `critical_max_limit`, `disabled_bid` after a `get_bids` fetch.
-- `bulk_update_log_message(updates)` — single statement at the end of each
-  account batch.
+- `reset_critical(promotion_id)` — sets all 5 critical_* columns to NULL.
+  Called from `apply_decision` when `set_manual_bid` returns 400 (Avito
+  rejected the bid = our bounds are stale). The next worker iteration sees
+  NULLs → `decision_engine` returns `FETCH_BIDS` → fresh values land via
+  `upsert_critical`.
+- `bulk_update_log_message(updates)` — single transaction with one
+  `UPDATE` per (promotion_id, message). Called per-ad immediately so the
+  UI sees fresh status without waiting for a multi-hour iteration to end.
 
 The DAL does **not** mutate `Account` rows. Tokens (`access_token`,
-`expires_in`) are read-only here — refresh устаревшего токена в БД остаётся
-задачей родительского API. Приоритет источников токена в `AccountSession.ensure_token`:
-(a) валидный `access_token` из БД; (b) in-memory токен от прошлой
-`authenticate(client_id, client_secret)` в этом воркере; (c) новая
-`authenticate`, если есть `client_id`/`client_secret`. Полученный через (c)
-токен **в БД не сохраняем** — он живёт в `AccountSession` на жизнь воркера;
-после перезапуска воркера supervisor'ом `authenticate` дёрнется заново.
-Если ни (a), ни (b), ни (c) не дали токен — `LOG_DISABLED_BY_TOKEN_EXPIRED`
-(нет credentials) или `LOG_DISABLED_BY_AUTH_FAILED` (Avito отверг).
+`expires_in`) are read-only here — refreshing a stale token in DB remains
+the parent API's job. Token resolution priority in
+`AccountSession.ensure_token`:
+(a) a valid `Account.access_token` from DB;
+(b) an in-memory token obtained earlier in this same worker via
+`authenticate(client_id, client_secret)`;
+(c) a fresh `authenticate` call, if `client_id` / `client_secret` are
+present.
+A token obtained via (c) is **not persisted** to DB — it lives in the
+`AccountSession` for the worker's lifetime; when the supervisor restarts
+the worker, `authenticate` is dialled again. If none of (a)/(b)/(c)
+produce a token: `LOG_DISABLED_BY_TOKEN_EXPIRED` (no credentials) or
+`LOG_DISABLED_BY_AUTH_FAILED` (Avito rejected).
 
 ## Decision engine contract
 
@@ -125,25 +141,41 @@ returns an `Action` (NOOP, FETCH_BIDS, SET_BID, REMOVE) plus the bid/limit
 to send, the canonical `log_message`, and flags for `write_log` /
 `write_system_note` / `update_critical`. Stages are ordered with early
 exit; the precise order is documented in the docstring of
-`decision_engine.py` (17 stages, повторены в коде). Key rules:
+`decision_engine.py` (17 stages, mirrored in the code).
+
+Key rules:
 
 - If `critical_*` fields on the row are NULL → return `FETCH_BIDS`. Caller
   fetches bid bounds via Avito API and re-runs `recompute_with_bids`.
-- **`bid` обязателен.** Если за пределами `critical_min_bid` /
-  `critical_max_bid` — NOOP с `LOG_BID_BELOW_MIN` / `LOG_BID_ABOVE_MAX_PREFIX`.
-  Ставку **не зажимаем** — это сигнал оператору, что граница нарушена.
-- **`daily_budget` опционален.** Если `None` — `limitPenny` в `set_manual_bid`
-  не отправляем, бюджетные стадии (7) пропускаем. Если задан и вышел за
-  `critical_min_limit` / `critical_max_limit` — зажимаем до критического и
-  округляем до целого рубля (100 копеек): нижний предел вверх, верхний
-  вниз, чтобы остаться внутри границ.
+- **`bid` is mandatory.** If outside `critical_min_bid` /
+  `critical_max_bid` — NOOP with `LOG_BID_BELOW_MIN` /
+  `LOG_BID_ABOVE_MAX_PREFIX`. We **do not clamp** the bid — that is the
+  signal to the operator that the configured bid violates Avito's bounds.
+- **`daily_budget` is optional.** If `None`, `limitPenny` is not sent to
+  `set_manual_bid` and the budget stage (7) is skipped. If set, it goes
+  through `_round_to_ruble_within_critical`: **half-up** rounding to
+  100 kopecks (15.3 → 15 ₽, 15.5 → 16 ₽; Python's built-in `round()`
+  uses banker's rounding and would give 100 for 100.5, which is
+  counter-intuitive for us), then clamped into
+  `[critical_min_limit, critical_max_limit]`. The bounds themselves are
+  also snapped to the ruble: min — ceil, max — floor, so the result is
+  guaranteed to lie inside Avito's platform limits.
 - `compare_percent` is picked by `pick_compare_percent(bid, manual.bids[])`
   — sort by `valuePenny`, find the segment `current.valuePenny <= bid <
   next.valuePenny`. Below min → `bids[0].compare`; above max →
   `bids[-1].compare`; empty → `0`.
-- Disabled-by-time uses `weekday_abbr(now)` against `work_days` and a
-  24-bit `work_hours_mask`. On disable due to schedule, the logged bid is
-  `disabled_bid` (the base rate, not the current `bid`).
+- Disabled-by-time: `inp.now.strftime("%a") not in p.work_days` or the
+  hour's bit in the 24-bit `work_hours_mask` is unset → REMOVE.
+  `strftime("%a")` returns the Russian abbreviation when
+  `LC_TIME=ru_RU.UTF-8` (the locale is set in `__main__.setup_logging`;
+  if the OS does not have it, every ad would cascade into
+  `LOG_DISABLED_BY_TIME` — set the locale in the Dockerfile). On
+  schedule-disable the logged bid is `disabled_bid` (the base rate, not
+  the current `bid`).
+- Tariff stage (3) is disabled when `profile.manual_promotion_limit <= 0`,
+  the end date is past, or `profile_active_count` already exceeds the
+  tariff limit (collective protection against parent-API races leaking
+  over-quota promotions into the DB).
 
 ## Russian strings are contract, not localizable
 
@@ -173,24 +205,26 @@ side.
 | `set_manual_bid`                  | 20/min/account    | — (invalidates bids cache)                   |
 | `remove_cpxpromo`                 | 300/min/account   | —                                            |
 
-Проактивного rate-лимитера нет: на 429/5xx `AvitoService` сам ждёт по
-`x-ratelimit-retry-after` и повторяет запрос. Внутри аккаунта вызовы
-последовательные (`asyncio.gather` — только по аккаунтам), так что
-неконтролируемого фан-аута нет.
+There is no proactive rate limiter: on 429/5xx `AvitoService` waits per
+`x-ratelimit-retry-after` and retries. Inside an account the calls are
+sequential (`asyncio.gather` only fans out across accounts), so no
+uncontrolled burst.
 
-The OAuth `authenticate` endpoint (`POST /token`) дёргается **только** при
-первичном получении токена — когда в БД нет валидного `access_token`, но
-аккаунт пришёл с `client_id`/`client_secret`. Результат in-memory только,
-в `Account.access_token` мы его не пишем. Refresh устаревшего токена в БД
-— по-прежнему задача родительского API.
+The OAuth `authenticate` endpoint (`POST /token`) is called **only** for
+first-time token acquisition — when DB has no valid `access_token` but the
+account carries `client_id` / `client_secret`. The result lives in
+`AccountSession` memory only; we do not write it to
+`Account.access_token`. Refreshing a stale token in DB remains the parent
+API's job.
 
-The batch `getPromotionsByItemIds` endpoint is **not** called either — drift
-("did we already send this bid?") is detected against the last row in
-`manual_promotion_log` rather than against Avito's actual state. Trade-off: для
-объявлений с заданным `daily_budget` это означает повторный `set_manual_bid`
-раз в cooldown (1 ч), даже если ничего не поменялось — лимит туда мы не
-пишем и состояния не отслеживаем. Для объявлений без `daily_budget` drift
-триггерится только сменой `bid`. Всё в пределах rate-лимитов.
+The batch `getPromotionsByItemIds` endpoint is **not** called either —
+drift ("did we already send this bid?") is detected against the last row
+in `manual_promotion_log` rather than against Avito's actual state.
+Trade-off: for ads with `daily_budget` set, this re-pushes
+`set_manual_bid` once per cooldown (1 h) even when nothing has changed —
+we don't write the limit to the log and don't track its state separately.
+For ads without `daily_budget` drift triggers only when `bid` changes.
+Both fit well within rate limits.
 
 Statistics (`ad_detail_statistic`) are **not** cached in Redis — they're
 read from PostgreSQL every cycle (cheap; the parent service maintains the
@@ -198,18 +232,20 @@ table).
 
 ## Dispatcher state lives in PostgreSQL, not Redis
 
-There is no Redis state store. Что было раньше в `mp:last_set:*` /
-`mp:last_event:*` теперь читается прямо из БД:
+There is no Redis state store. What used to be `mp:last_set:*` /
+`mp:last_event:*` is now derived directly from DB:
 
-- **Cooldown 1 ч** — якорь это `ctx.last_log.timestamp` (последняя запись в
-  `manual_promotion_log`). Заметь: `manual_promotion_log` пишется и на
-  SET_BID, и на почасовой snapshot, поэтому cooldown может «съезжать»
-  вперёд на ~1 ч в худшем случае (drift сразу после hourly snapshot подождёт
-  ещё час). Принято осознанно — упрощение важнее.
-- **Дедупликация system-заметок** — сравниваем `decision.log_message` с
-  `ctx.promotion.log_message`. Если состояние не изменилось — заметку не
-  пишем. `promotion.log_message` обновляется в конце цикла через
-  `bulk_update_log_message`, так что следующий цикл видит свежее значение.
+- **1-hour cooldown** — anchored at `ctx.last_log.timestamp` (the latest
+  `manual_promotion_log` row). Note: `manual_promotion_log` is written
+  both on SET_BID and on the hourly snapshot, so the cooldown anchor can
+  drift forward by up to ~1 h in the worst case (drift right after an
+  hourly snapshot has to wait another hour). Accepted on purpose —
+  simplicity over precision.
+- **System-note deduplication** — we compare `decision.log_message`
+  against `ctx.promotion.log_message`. If the state is unchanged, we skip
+  the note. `promotion.log_message` is written per-ad inside the
+  iteration via `bulk_update_log_message`, so the next iteration sees the
+  fresh value.
 
 ## Coding conventions
 
@@ -217,8 +253,8 @@ There is no Redis state store. Что было раньше в `mp:last_set:*` /
 - **black** line-length 79, **ruff** line-length 88
   (`select = ["E","W","F","I","B","C4","UP"]`), **mypy** `py312`,
   `ignore_missing_imports = true`.
-- **loguru** for logging — never stdlib `logging`. Use the bidder's
-  `sanitize_message` patcher.
+- **loguru** for logging — never stdlib `logging`. Use the
+  `sanitize_message` patcher from `app/utils/logging_utils.py`.
 - **SQLAlchemy 2.0 async** with `async_sessionmaker(expire_on_commit=False)`.
 - **No new top-level dependencies without a reason** — the runtime set is
   intentionally minimal (no aiogram / no aiohttp-socks; logs go only to

@@ -83,12 +83,19 @@ class Database:
 
     async def load_account_promotions(
         self, account_id: int
-    ) -> tuple[Account, list[PromotionContext]] | None:
+    ) -> tuple[Account, list[PromotionContext], int] | None:
         """Снимок всех активных promotion'ов одного аккаунта.
 
-        Возвращает (Account, list[PromotionContext]) либо None, если у
-        аккаунта не осталось активных строк (тогда воркер выходит — supervisor
-        снова не заведёт его, пока в БД не появится активный promotion).
+        Возвращает (Account, list[PromotionContext], profile_active_count)
+        либо None, если у аккаунта не осталось активных строк (тогда воркер
+        выходит — supervisor не заведёт его, пока не появится активный
+        promotion).
+
+        `profile_active_count` — суммарное число активных promotion'ов по
+        всем аккаунтам того же profile_id. Нужно decision_engine'у, чтобы
+        дополнительно сверить с `profile.manual_promotion_limit` на случай
+        гонки с родительским API (если в БД оказалось больше активных
+        строк, чем разрешает тариф).
         """
         async with self._sessionmaker() as session:
             stmt = (
@@ -106,6 +113,19 @@ class Database:
                 return None
 
             account = rows[0][1]
+            profile_id = account.profile_id
+
+            count_stmt = (
+                select(func.count(ManualPromotion.id))
+                .join(Account, Account.id == ManualPromotion.account_id)
+                .where(Account.profile_id == profile_id)
+                .where(ManualPromotion.status.is_(True))
+                .where(ManualPromotion.deleted_at.is_(None))
+            )
+            profile_active_count = int(
+                (await session.execute(count_stmt)).scalar_one()
+            )
+
             promotion_ids = [row[0].id for row in rows]
             last_logs = await self._load_last_logs(session, promotion_ids)
 
@@ -120,7 +140,7 @@ class Database:
                     last_log=last_logs.get(promotion.id),
                 )
             )
-        return account, contexts
+        return account, contexts, profile_active_count
 
     @staticmethod
     async def _load_last_logs(
@@ -139,7 +159,10 @@ class Database:
 
         stmt = select(ManualPromotionLog).join(
             latest_ts,
-            (ManualPromotionLog.manual_promotion_id == latest_ts.c.manual_promotion_id)
+            (
+                ManualPromotionLog.manual_promotion_id
+                == latest_ts.c.manual_promotion_id
+            )
             & (ManualPromotionLog.timestamp == latest_ts.c.max_ts),
         )
         result = (await session.execute(stmt)).scalars().all()
@@ -177,7 +200,9 @@ class Database:
             .join(Ad, Ad.id == AdDetailStatistic.ad_id)
             .where(AdDetailStatistic.account_id == account_id)
             .where(AdDetailStatistic.timestamp >= day_start)
-            .order_by(AdDetailStatistic.ad_id, AdDetailStatistic.timestamp.desc())
+            .order_by(
+                AdDetailStatistic.ad_id, AdDetailStatistic.timestamp.desc()
+            )
         )
 
         async with self._sessionmaker() as session:
@@ -238,7 +263,9 @@ class Database:
             )
             await session.commit()
 
-    async def upsert_critical(self, promotion_id: int, payload: CriticalUpdate) -> None:
+    async def upsert_critical(
+        self, promotion_id: int, payload: CriticalUpdate
+    ) -> None:
         async with self._sessionmaker() as session:
             await session.execute(
                 update(ManualPromotion)
@@ -249,6 +276,28 @@ class Database:
                     critical_min_limit=payload.critical_min_limit,
                     critical_max_limit=payload.critical_max_limit,
                     disabled_bid=payload.disabled_bid,
+                )
+            )
+            await session.commit()
+
+    async def reset_critical(self, promotion_id: int) -> None:
+        """Сбрасывает все 5 critical-полей ManualPromotion в NULL.
+
+        Вызывается из apply_decision когда Avito отверг set_manual_bid (400)
+        — границы устарели. Следующая итерация воркера увидит NULL'ы,
+        decision_engine вернёт FETCH_BIDS, upsert_critical перепишет
+        свежие значения.
+        """
+        async with self._sessionmaker() as session:
+            await session.execute(
+                update(ManualPromotion)
+                .where(ManualPromotion.id == promotion_id)
+                .values(
+                    critical_min_bid=None,
+                    critical_max_bid=None,
+                    critical_min_limit=None,
+                    critical_max_limit=None,
+                    disabled_bid=None,
                 )
             )
             await session.commit()

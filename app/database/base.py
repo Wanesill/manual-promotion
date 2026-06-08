@@ -10,7 +10,9 @@ from sqlalchemy.orm import (
 
 
 class Base(DeclarativeBase):
-    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger, autoincrement=True, primary_key=True
+    )
 
     @classmethod
     @declared_attr  # type: ignore[arg-type]
