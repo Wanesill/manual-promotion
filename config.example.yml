@@ -1,0 +1,17 @@
+# База данных PostgreSQL (схему ведёт родительский API-сервис).
+database:
+  dsn: "postgresql+asyncpg://username:password@host:5432/dbname"
+  echo: false
+  pool_size: 5
+  max_overflow: 3
+  pool_timeout: 30
+  pool_recycle: 600
+
+# Redis: кэш Avito-снапшотов и state store (last_set_at / last_event).
+redis:
+  dsn: "redis://:password@host:6379/0"
+
+# Логирование (loguru): stderr + ротация файлов в logs/.
+logging:
+  level: 20            # DEBUG=10, INFO=20, WARNING=30, ERROR=40, CRITICAL=50
+  console: true        # дублировать ли в stderr (цветной формат)
