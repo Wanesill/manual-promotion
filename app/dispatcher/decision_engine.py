@@ -3,7 +3,7 @@
 Без I/O: принимает контекст, возвращает Decision (что делать дальше).
 Caller (apply_decision) выполняет сетевые вызовы и записи в БД.
 
-Stages (по плану idempotent-launching-kahan.md):
+Stages (порядок ранних выходов, повторён в коде compute_target_state):
 1. ad.status != active                    → NOOP   LOG_USER_DELETED
 2. promotion.bid/daily_budget IS NULL     → NOOP   LOG_NOT_CONFIGURED
 3. profile / limit / end_date             → NOOP   LOG_DISABLED_BY_TARIFF

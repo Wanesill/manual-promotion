@@ -1,9 +1,8 @@
 """Русские константы log_message и системных заметок.
 
-Все сообщения end-user-видимые, формат фиксирован и используется
-также в API-сервисе (`docs/api/manual_promotion/service.py`) для
-определения status_code (success/stopped/error). Не переводить
-без продуктовой причины.
+Все сообщения end-user-видимые, формат фиксирован — родительский API
+парсит их (в т.ч. по префиксу `LOG_BID_ABOVE_MAX_PREFIX`) для определения
+status_code (success/stopped/error). Не переводить без продуктовой причины.
 """
 
 from __future__ import annotations

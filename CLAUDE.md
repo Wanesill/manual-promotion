@@ -110,9 +110,8 @@ and skip the account for this cycle.
 returns an `Action` (NOOP, FETCH_BIDS, SET_BID, REMOVE) plus the bid/limit
 to send, the canonical `log_message`, and flags for `write_log` /
 `write_system_note` / `update_critical`. Stages are ordered with early
-exit; the precise order is the table at the top of
-`docs/.../idempotent-launching-kahan.md` and in the docstring of
-`decision_engine.py`. Key rules:
+exit; the precise order is documented in the docstring of
+`decision_engine.py` (18 stages, повторены в коде). Key rules:
 
 - If `critical_*` fields on the row are NULL → return `FETCH_BIDS`. Caller
   fetches bid bounds via Avito API and re-runs `recompute_with_bids`.
@@ -185,34 +184,6 @@ scoping.
 
 Worst case after losing Redis: one redundant `set_manual_bid` per ad in the
 next cycle and one duplicated note per promotion. Acceptable.
-
-## The `docs/` directory is reference, not source
-
-`docs/` is gitignored (see `.gitignore`) and is **read-only reference
-material** carried over from a larger monolith. Files there import packages
-(`app.database`, `app.external_services`, `app.service`, `app.locales`,
-`app.auth`, `app.core.responses`, `app.bidder`, `fluentogram`) that don't
-exist in this repo — don't symlink or copy them blindly.
-
-- `docs/promotion/` — source-monolith logic. Useful for: the
-  `@retry_with_backoff` decorator, exact request bodies for
-  `set_manual_bid` / `remove_cpxpromo`, `AccountForbiddenError` semantics.
-  **Не копируй** token-refresh pattern из монолита: здесь токены пишет
-  родительский сервис, дёргать `/token` запрещено. Также не нужны
-  Google-Sheets / `PromotionQueue` куски.
-- `docs/api/manual_promotion/` — the parent FastAPI module. Read it before
-  changing response shapes or `log_message` formats — schemas there are
-  the contract. The custom `PlainSerializer` annotations (`MoneyRub`,
-  `MoneyRubZero`, `Percent`, etc.) describe how our kopeck-based values
-  are exposed.
-- `docs/bidder/` — the sibling `avito-bidder` project. Its
-  `docs/bidder/CLAUDE.md` documents architectural conventions inherited
-  here: loguru `setup_logging`, Pydantic+YAML config via
-  `get_config(model, root_key)`, SQLAlchemy 2.0 async with
-  `postgresql+asyncpg://`, locale `ru_RU.UTF-8`, black line-length 79,
-  ruff line-length 88 with `select = ["E","W","F","I","B","C4","UP"]`,
-  mypy py312. The bidder's worker/scraper/Camoufox/captcha pieces are
-  irrelevant to manual promotion — ignore them.
 
 ## Coding conventions
 

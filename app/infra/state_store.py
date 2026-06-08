@@ -7,7 +7,7 @@
 Read-after-write на own writes гарантируется отсутствием конкуренции
 (один инстанс dispatcher). При потере Redis worst case — лишний
 set_manual_bid в следующем цикле и одна дублированная заметка
-при рестарте (приемлемо, см. план).
+при рестарте (приемлемо).
 """
 
 from __future__ import annotations

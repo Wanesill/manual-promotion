@@ -1,6 +1,6 @@
 """Парсинг ответа Avito get_bids в границы для нашего decision engine.
 
-Сырая структура `manual` блока (см. план):
+Сырая структура `manual` блока в ответе Avito CPxPromo:
     {
         "bidPenny": int,
         "limitPenny": int,
