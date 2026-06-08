@@ -36,7 +36,7 @@ from app.dispatcher.critical_bids import (
     pick_compare_percent,
 )
 from app.log_messages import (
-    DISABLED_EVENTS,
+    LOG_BID_ABOVE_MAX_PREFIX,
     LOG_BID_BELOW_MIN,
     LOG_BID_CHANGE_FAILED,
     LOG_DISABLED_BY_ACCOUNT_DELETED,
@@ -50,12 +50,10 @@ from app.log_messages import (
     LOG_DISABLED_BY_VIEWS,
     LOG_LIMIT_EXCEEDED,
     LOG_NOT_CONFIGURED,
-    LOG_PROMOTION_RESUMED,
     LOG_PROMOTION_UNAVAILABLE,
     LOG_SUCCESS,
     LOG_USER_DELETED,
     SOFT_DISABLED_LOGS,
-    format_bid_above_max,
 )
 from app.utils.time_utils import is_in_work_schedule
 
@@ -158,13 +156,6 @@ def _system_note_text(
     """Возвращает (need_write, text) для системной заметки."""
     if cached_event == log_message:
         return None
-    # Возобновление: переход из disabled-состояния в успешное.
-    if (
-        log_message == LOG_SUCCESS
-        and cached_event is not None
-        and cached_event in DISABLED_EVENTS
-    ):
-        return True, LOG_PROMOTION_RESUMED
     if log_message in SOFT_DISABLED_LOGS or log_message in (
         LOG_DISABLED_BY_TARIFF,
         LOG_LIMIT_EXCEEDED,
@@ -340,10 +331,9 @@ def compute_target_state(inp: DecisionInput) -> Decision:
         )
     # 15. ставка выше максимума
     if bid > bounds.critical_max_bid:
-        msg = format_bid_above_max(bounds.critical_max_bid)
         return Decision(
             action=Action.NOOP,
-            log_message=msg,
+            log_message=LOG_BID_ABOVE_MAX_PREFIX,
         )
 
     limit_to_send = _clamp_limit(p.daily_budget, bounds)

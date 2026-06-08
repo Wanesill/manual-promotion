@@ -11,7 +11,6 @@ from __future__ import annotations
 from typing import Final
 
 __all__ = [
-    "DISABLED_EVENTS",
     "LOG_BID_ABOVE_MAX_PREFIX",
     "LOG_BID_BELOW_MIN",
     "LOG_BID_CHANGE_FAILED",
@@ -30,13 +29,11 @@ __all__ = [
     "LOG_LIMIT_EXCEEDED",
     "LOG_NOT_CONFIGURED",
     "LOG_PROMOTION_DISABLED",
-    "LOG_PROMOTION_RESUMED",
     "LOG_PROMOTION_UNAVAILABLE",
     "LOG_SUCCESS",
     "LOG_USER_DELETED",
     "NOTE_KIND_SYSTEM",
     "SOFT_DISABLED_LOGS",
-    "format_bid_above_max",
 ]
 
 # Успех.
@@ -52,9 +49,6 @@ LOG_DISABLED_BY_CONTACTS: Final[str] = "Отключено по контакта
 LOG_DISABLED_BY_CPV: Final[str] = "Отключено по стоимости просмотра"
 LOG_DISABLED_BY_CPC: Final[str] = "Отключено по стоимости контакта"
 LOG_USER_DELETED: Final[str] = "Снято с ручного продвижения"
-
-# Возобновление после disable (для системной заметки).
-LOG_PROMOTION_RESUMED: Final[str] = "Продвижение возобновлено"
 
 # Ошибки и блокирующие условия.
 LOG_NOT_CONFIGURED: Final[str] = "Не настроено ручное продвижение"
@@ -75,14 +69,8 @@ LOG_BID_CHANGE_FAILED: Final[str] = "Не удалось изменить ста
 NOTE_KIND_SYSTEM: Final[str] = "system"
 
 
-def format_bid_above_max(critical_max_bid_penny: int) -> str:
-    """Форматирует сообщение `Ставка должна быть меньше …` с суммой в ₽."""
-    rub = critical_max_bid_penny // 100
-    return f"{LOG_BID_ABOVE_MAX_PREFIX}: {rub}"
-
-
 # События мягкого отключения — для них пишем системную заметку
-# при первом срабатывании и проверяем переход на возобновление.
+# при первом срабатывании.
 SOFT_DISABLED_LOGS: Final[frozenset[str]] = frozenset(
     {
         LOG_DISABLED_BY_TIME,
@@ -92,21 +80,5 @@ SOFT_DISABLED_LOGS: Final[frozenset[str]] = frozenset(
         LOG_DISABLED_BY_CONTACTS,
         LOG_DISABLED_BY_CPV,
         LOG_DISABLED_BY_CPC,
-    }
-)
-
-# Все возможные «выключающие» события, после которых переход
-# на LOG_SUCCESS требует заметки о возобновлении.
-DISABLED_EVENTS: Final[frozenset[str]] = SOFT_DISABLED_LOGS | frozenset(
-    {
-        LOG_DISABLED_BY_TARIFF,
-        LOG_LIMIT_EXCEEDED,
-        LOG_PROMOTION_UNAVAILABLE,
-        LOG_DISABLED_BY_ACCOUNT_DELETED,
-        LOG_DISABLED_BY_TOKEN_EXPIRED,
-        LOG_DISABLED_BY_AUTH_FAILED,
-        LOG_DISABLED_BY_ACCOUNT_BALANCE,
-        LOG_BID_CHANGE_FAILED,
-        LOG_BID_BELOW_MIN,
     }
 )
