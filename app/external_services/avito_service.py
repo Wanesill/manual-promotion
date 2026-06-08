@@ -8,9 +8,12 @@ HTTP 403 пробрасывается как AccountForbiddenError для caller
 Проактивного rate-лимитинга нет — рассчитываем на инструкции Avito в
 заголовке `x-ratelimit-retry-after` при 429 и реактивный backoff.
 
-Аутентификация (получение access_token по client_id/secret) НЕ выполняется
-этим сервисом — токен пишет родительский API. Здесь токен только читается
-из БД и используется как есть.
+Аутентификация (`POST /token` через `authenticate`) дёргается ТОЛЬКО при
+первичном получении токена — когда у аккаунта в БД нет валидного
+`access_token`, но есть `client_id`/`client_secret`. Результат в БД не
+сохраняем: caller (`AccountSession`) держит токен в памяти на жизнь
+воркера; при перезапуске воркера supervisor'ом — повторно дёргаем.
+Refresh устаревшего токена в БД — задача родительского API.
 """
 
 from __future__ import annotations
@@ -157,6 +160,70 @@ class AvitoService:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
+
+    # ---------- аутентификация ----------
+
+    @classmethod
+    async def authenticate(
+        cls,
+        client_id: str,
+        client_secret: str,
+    ) -> dict:
+        """OAuth client_credentials → POST /token.
+
+        Используется при первичном получении токена для аккаунта (когда у
+        нас нет валидного `Account.access_token`). Результат **в БД не
+        сохраняем** — caller (`AccountSession`) кэширует токен в памяти
+        на время жизни воркера; при перезапуске воркера дёргаем снова.
+
+        На 429/5xx ждём по `x-ratelimit-retry-after` и повторяем; на
+        сетевую ошибку — экспоненциальный backoff. На фатальный HTTP
+        (4xx кроме 429) — `raise_for_status()` пробрасывает исключение.
+        """
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        }
+        session = await cls.get_session()
+        last_exc: BaseException | None = None
+        for attempt in range(5):
+            try:
+                async with session.post(
+                    url="https://api.avito.ru/token",
+                    data=data,
+                    headers=headers,
+                    timeout=cls.ten_minutes_timeout,
+                ) as response:
+                    if response.status in (429, 500, 503, 504):
+                        retry_after = int(
+                            response.headers.get("x-ratelimit-retry-after", "5")
+                        )
+                        await asyncio.sleep(retry_after)
+                        continue
+                    response.raise_for_status()
+                    return await response.json()
+            except (
+                TimeoutError,
+                ServerDisconnectedError,
+                ClientConnectorError,
+                ClientPayloadError,
+            ) as err:
+                last_exc = err
+                wait_time = 2**attempt
+                logger.warning(
+                    "Авторизация Avito попытка {}/5 {}: {} — ждём {}с",
+                    attempt + 1,
+                    type(err).__name__,
+                    err,
+                    wait_time,
+                )
+                if attempt < 4:
+                    await asyncio.sleep(wait_time)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Авторизация Avito: исчерпаны попытки")
 
     # ---------- per-ad: границы ставок ----------
 

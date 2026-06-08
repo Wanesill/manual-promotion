@@ -38,9 +38,14 @@ API. Каждые 5 минут читает таблицу `manual_promotion` и
   только читаем + редактируем whitelisted-поля (`log_message`,
   `critical_*`, `disabled_bid`) и append-only-таблицы
   `manual_promotion_log` / `manual_promotion_note`.
-- **Токены аккаунтов не обновляем.** `access_token` / `expires_in` пишет
-  родительский сервис; здесь только читаем. Если токен истёк —
-  `LOG_DISABLED_BY_TOKEN_EXPIRED`, цикл по аккаунту пропускаем.
+- **Токены аккаунтов в БД не обновляем.** Refresh устаревшего
+  `Account.access_token` — задача родительского сервиса. Здесь
+  используем валидный токен из БД, если он есть; если нет, но есть
+  `client_id`/`client_secret`, дёргаем `authenticate(/token)` **один раз
+  на жизнь воркера** и держим результат в памяти `AccountSession`.
+  При перезапуске воркера supervisor'ом — дёргаем снова. Если ни токена,
+  ни credentials нет — `LOG_DISABLED_BY_TOKEN_EXPIRED`. Если
+  `authenticate` упал — `LOG_DISABLED_BY_AUTH_FAILED`.
 - **Статистика метрик из БД.** Каждая запись в `ad_detail_statistic` —
   накопительный счётчик за сегодня (сбрасывается в 00:00). Берём последнюю
   запись на ad за сегодня (`DISTINCT ON (ad_id) ... ORDER BY timestamp

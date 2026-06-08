@@ -108,9 +108,15 @@ rate-лимитера нет; на 429 `AvitoService` сам ждёт по
   account batch.
 
 The DAL does **not** mutate `Account` rows. Tokens (`access_token`,
-`expires_in`) are read-only here — refresh is the parent service's
-responsibility. If `expires_in <= now()` we log `LOG_DISABLED_BY_TOKEN_EXPIRED`
-and skip the account for this cycle.
+`expires_in`) are read-only here — refresh устаревшего токена в БД остаётся
+задачей родительского API. Приоритет источников токена в `AccountSession.ensure_token`:
+(a) валидный `access_token` из БД; (b) in-memory токен от прошлой
+`authenticate(client_id, client_secret)` в этом воркере; (c) новая
+`authenticate`, если есть `client_id`/`client_secret`. Полученный через (c)
+токен **в БД не сохраняем** — он живёт в `AccountSession` на жизнь воркера;
+после перезапуска воркера supervisor'ом `authenticate` дёрнется заново.
+Если ни (a), ни (b), ни (c) не дали токен — `LOG_DISABLED_BY_TOKEN_EXPIRED`
+(нет credentials) или `LOG_DISABLED_BY_AUTH_FAILED` (Avito отверг).
 
 ## Decision engine contract
 
@@ -172,8 +178,11 @@ side.
 последовательные (`asyncio.gather` — только по аккаунтам), так что
 неконтролируемого фан-аута нет.
 
-The OAuth `authenticate` endpoint is **not** called from this service —
-token refresh is owned by the parent API.
+The OAuth `authenticate` endpoint (`POST /token`) дёргается **только** при
+первичном получении токена — когда в БД нет валидного `access_token`, но
+аккаунт пришёл с `client_id`/`client_secret`. Результат in-memory только,
+в `Account.access_token` мы его не пишем. Refresh устаревшего токена в БД
+— по-прежнему задача родительского API.
 
 The batch `getPromotionsByItemIds` endpoint is **not** called either — drift
 ("did we already send this bid?") is detected against the last row in

@@ -154,18 +154,26 @@ async def _account_loop(
     stop_event: asyncio.Event,
     worker_stop: asyncio.Event,
 ) -> None:
-    """Бесконечный цикл одного аккаунта."""
+    """Бесконечный цикл одного аккаунта.
+
+    `session` живёт на всю жизнь воркера — это нужно, чтобы in-memory токен
+    от `authenticate` сохранялся между итерациями. Если воркер крашится и
+    supervisor перезапускает его — у нового экземпляра `session=None`,
+    и `authenticate` дёрнется заново (это и есть «refresh через restart»).
+    """
     iteration = 0
+    session: AccountSession | None = None
     while not stop_event.is_set() and not worker_stop.is_set():
         iteration += 1
         iter_start = time.monotonic()
         try:
-            done = await _account_cycle(
+            done, session = await _account_cycle(
                 account_id=account_id,
                 database=database,
                 cache=cache,
                 stop_event=stop_event,
                 worker_stop=worker_stop,
+                session=session,
             )
         except Exception:
             logger.exception("account {} итерация {} упала", account_id, iteration)
@@ -192,27 +200,33 @@ async def _account_cycle(
     cache: AvitoCache,
     stop_event: asyncio.Event,
     worker_stop: asyncio.Event,
-) -> bool:
-    """Одна итерация цикла. Возвращает True, если воркер должен завершиться.
+    session: AccountSession | None,
+) -> tuple[bool, AccountSession | None]:
+    """Одна итерация цикла. Возвращает (done, session).
 
-    Завершение происходит когда у аккаунта не осталось активных promotion'ов
-    (load_account_promotions вернул None) — supervisor подберёт.
+    `done=True` — у аккаунта не осталось активных promotion'ов
+    (load_account_promotions вернул None), воркер завершается.
+    `session` — пробрасывается дальше, чтобы in-memory токен пережил итерацию.
     """
     snapshot = await database.load_account_promotions(account_id)
     if snapshot is None:
-        return True
+        return True, session
     account, contexts = snapshot
+
+    if session is None:
+        session = AccountSession(account=account, cache=cache)
+    else:
+        session.update_account(account)
 
     if account.status == "deleted":
         await _bulk_set_log(database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED)
-        return False
+        return False, session
 
-    session = AccountSession(account=account, cache=cache)
     try:
         await session.ensure_token()
     except AccountTokenError as err:
         await _bulk_set_log(database, contexts, err.log_message)
-        return False
+        return False, session
 
     stats = await session.fetch_stats_today(database)
     stats_at = time.monotonic()
@@ -220,7 +234,7 @@ async def _account_cycle(
 
     for ctx in contexts:
         if stop_event.is_set() or worker_stop.is_set():
-            return False
+            return False, session
         if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
             try:
                 stats = await session.fetch_stats_today(database)
@@ -243,7 +257,7 @@ async def _account_cycle(
         if log_message is not None and log_message != ctx.promotion.log_message:
             await database.bulk_update_log_message([(ctx.promotion.id, log_message)])
             ctx.promotion.log_message = log_message
-    return False
+    return False, session
 
 
 async def _decide_and_apply(
