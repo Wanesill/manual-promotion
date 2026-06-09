@@ -68,8 +68,10 @@ LOG_BID_CHANGE_FAILED: Final[str] = "Не удалось изменить ста
 NOTE_KIND_SYSTEM: Final[str] = "system"
 
 
-# События мягкого отключения — для них пишем системную заметку
-# при первом срабатывании.
+# События мягкого отключения — для них пишем системную заметку при
+# первом срабатывании (переход active → soft-disabled, см.
+# decision_engine._system_note_text). Переходы внутри пула новых
+# заметок не порождают.
 SOFT_DISABLED_LOGS: Final[frozenset[str]] = frozenset(
     {
         LOG_DISABLED_BY_TIME,
@@ -79,5 +81,6 @@ SOFT_DISABLED_LOGS: Final[frozenset[str]] = frozenset(
         LOG_DISABLED_BY_CONTACTS,
         LOG_DISABLED_BY_CPV,
         LOG_DISABLED_BY_CPC,
+        LOG_PROMOTION_UNAVAILABLE,
     }
 )

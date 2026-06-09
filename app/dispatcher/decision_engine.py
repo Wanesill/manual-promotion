@@ -44,8 +44,6 @@ from app.dispatcher.critical_bids import (
 from app.log_messages import (
     LOG_BID_ABOVE_MAX_PREFIX,
     LOG_BID_BELOW_MIN,
-    LOG_BID_CHANGE_FAILED,
-    LOG_DISABLED_BY_ACCOUNT_DELETED,
     LOG_DISABLED_BY_BUDGET,
     LOG_DISABLED_BY_CONTACTS,
     LOG_DISABLED_BY_CPC,
@@ -194,20 +192,25 @@ def _system_note_text(
 ) -> tuple[bool, str] | None:
     """Возвращает (need_write, text) для системной заметки.
 
-    Дедупликация по последнему канонически записанному `log_message`
-    (`ManualPromotion.log_message`): если состояние не сменилось — не пишем.
+    Семантика: маркер на графике ставится в момент перехода active →
+    soft-disabled (объявление только что попало в одно из «мягких»
+    отключений: время / бюджет / показы / просмотры / контакты / CPV /
+    CPC / promotion unavailable). Переходы внутри soft-пула (TIME →
+    BUDGET и т.п.) не порождают новой заметки — на графике будет один
+    маркер «уехали в soft-disabled», текст соответствует первой причине.
+    Возврат active → soft происходит само через apply_decision (там
+    log_message не SOFT, return None отсюда).
+
+    Hard-disable (TARIFF, ACCOUNT_DELETED, TOKEN_EXPIRED, AUTH_FAILED,
+    BID_CHANGE_FAILED, BID_BELOW_MIN, BID_ABOVE_MAX_PREFIX) — заметку
+    НЕ пишем. Они отображаются как текущий статус в
+    `ManualPromotion.log_message`, маркер на графике добавлять не нужно.
     """
-    if prev_log_message == log_message:
+    if log_message not in SOFT_DISABLED_LOGS:
         return None
-    if log_message in SOFT_DISABLED_LOGS or log_message in (
-        LOG_DISABLED_BY_TARIFF,
-        LOG_PROMOTION_UNAVAILABLE,
-        LOG_DISABLED_BY_ACCOUNT_DELETED,
-        LOG_BID_CHANGE_FAILED,
-        LOG_BID_BELOW_MIN,
-    ):
-        return True, log_message
-    return None
+    if prev_log_message in SOFT_DISABLED_LOGS:
+        return None
+    return True, log_message
 
 
 # ---------- stages ----------
