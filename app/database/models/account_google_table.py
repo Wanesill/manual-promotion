@@ -1,16 +1,15 @@
-from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint
+from sqlalchemy import BigInteger, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
 
 
 class AccountGoogleTable(Base):
-    """Связь аккаунта с Google-таблицей по типу сервиса.
+    """Связь аккаунта с Google-таблицей для аналитики.
 
-    Junction-таблица. service_type определяет назначение
-    связи: analytics, bidder или manual_promotion.
-    Один аккаунт может быть привязан к одной таблице
-    по каждому типу сервиса.
+    Junction-таблица. Один аккаунт может быть привязан
+    к нескольким Google-таблицам, но не более одной строки
+    на пару (account_id, google_table_id).
     """
 
     account_id: Mapped[int] = mapped_column(
@@ -23,15 +22,11 @@ class AccountGoogleTable(Base):
         ForeignKey("google_table.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    service_type: Mapped[str] = mapped_column(
-        String(20), nullable=False
-    )  # analytics, bidder, manual_promotion
 
     __table_args__ = (
         UniqueConstraint(
             "account_id",
             "google_table_id",
-            "service_type",
-            name="uq_agt_account_table_service",
+            name="uq_agt_account_table",
         ),
     )
