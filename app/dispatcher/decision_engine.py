@@ -243,14 +243,16 @@ def _early_validation(
     # 3. tariff — лимит, дата истечения и проверка фактического overuse
     # (на случай гонки с родительским API: если в БД оказалось активных
     # promotion'ов больше, чем разрешает manual_promotion_limit, считаем
-    # тариф нерабочим для всего аккаунта).
+    # тариф нерабочим для всего аккаунта). `manual_promotion_end_date`
+    # — первый день, когда тариф уже не действует (т.е. последний
+    # рабочий день = end_date - 1), поэтому сравнение `<=` today.
     today = inp.now.date()
     if (
         ctx.profile is None
         or ctx.profile.manual_promotion_limit <= 0
         or inp.profile_active_count > ctx.profile.manual_promotion_limit
         or ctx.profile.manual_promotion_end_date is None
-        or ctx.profile.manual_promotion_end_date < today
+        or ctx.profile.manual_promotion_end_date <= today
     ):
         return Decision(
             action=Action.NOOP,
