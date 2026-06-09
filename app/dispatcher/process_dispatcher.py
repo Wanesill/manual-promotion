@@ -51,10 +51,12 @@ from app.external_services.avito_service import (
     AvitoService,
 )
 from app.log_messages import (
+    LOG_DISABLED_BY_ACCOUNT_BALANCE,
     LOG_DISABLED_BY_ACCOUNT_DELETED,
     LOG_DISABLED_BY_AUTH_FAILED,
     LOG_DISABLED_BY_TOKEN_EXPIRED,
     LOG_SUCCESS,
+    SOFT_DISABLED_LOGS,
 )
 
 if TYPE_CHECKING:
@@ -162,7 +164,9 @@ async def _supervisor_tick(
     # 2. остановить воркеры неактивных аккаунтов (graceful, между ad'ами)
     for acc_id, worker in workers.items():
         if acc_id not in active_ids and not worker.stop.is_set():
-            logger.info("account {} больше не активен — останавливаем воркер", acc_id)
+            logger.info(
+                "account {} больше не активен — останавливаем воркер", acc_id
+            )
             worker.stop.set()
 
     # 3. поднять воркеры для новых активных аккаунтов
@@ -212,7 +216,9 @@ async def _account_loop(
                 iter_deadline=iter_deadline,
             )
         except Exception:
-            logger.exception("account {} итерация {} упала", account_id, iteration)
+            logger.exception(
+                "account {} итерация {} упала", account_id, iteration
+            )
             done = False
 
         elapsed = time.monotonic() - iter_start
@@ -284,10 +290,40 @@ async def _account_cycle(
             "account {}: status=deleted — выставляем LOG_DISABLED_BY_ACCOUNT_DELETED",
             account_id,
         )
-        await _bulk_set_log(database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED)
+        await _bulk_set_log(
+            database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED
+        )
         return False, None
 
-    # 2. Авторизация — inline, без долгоживущего state.
+    # 2. Аванс аккаунта. Снимок ведёт родительский сервис в
+    # `account_state_history` (поле `advance_balance`); если последнее
+    # известное значение <= 0 — продвигать нечем, выставляем soft-disable
+    # на все объявления и пропускаем итерацию до auth/обхода. `None`
+    # (нет записей / `advance_balance is NULL`) трактуем как «неизвестно»
+    # и не блокируем — синхронно с поведением bidder.
+    advance_balance = await database.load_account_advance_balance(account_id)
+    if advance_balance is not None and advance_balance <= 0:
+        logger.info(
+            "account {}: advance_balance={} — выставляем "
+            "LOG_DISABLED_BY_ACCOUNT_BALANCE",
+            account_id,
+            advance_balance,
+        )
+        # Заметки пишем ДО _bulk_set_log: дедупликация смотрит на
+        # текущий promotion.log_message, которое _bulk_set_log не
+        # модифицирует в памяти, но порядок сохраняет инвариант явно.
+        await _bulk_record_disable_notes(
+            database,
+            contexts,
+            LOG_DISABLED_BY_ACCOUNT_BALANCE,
+            datetime.now(),
+        )
+        await _bulk_set_log(
+            database, contexts, LOG_DISABLED_BY_ACCOUNT_BALANCE
+        )
+        return False, None
+
+    # 3. Авторизация — inline, без долгоживущего state.
     avito = await _resolve_avito(account)
     if avito is None:
         # _resolve_avito уже залогировал причину; решаем какой log_message
@@ -317,7 +353,9 @@ async def _account_cycle(
             return False, iter_stats
         if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
             try:
-                today_stats = await database.load_today_stats(account_id=account.id)
+                today_stats = await database.load_today_stats(
+                    account_id=account.id
+                )
             except Exception:
                 logger.exception("account {} refresh stats упал", account_id)
             else:
@@ -339,8 +377,13 @@ async def _account_cycle(
             iter_stats.errors += 1
             logger.exception("Сбой обработки promotion={}", ctx.promotion.id)
             continue
-        if log_message is not None and log_message != ctx.promotion.log_message:
-            await database.bulk_update_log_message([(ctx.promotion.id, log_message)])
+        if (
+            log_message is not None
+            and log_message != ctx.promotion.log_message
+        ):
+            await database.bulk_update_log_message(
+                [(ctx.promotion.id, log_message)]
+            )
             ctx.promotion.log_message = log_message
     return False, iter_stats
 
@@ -396,7 +439,9 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
         )
         return None
 
-    return AvitoService(user_id=account.user_id, token=token_data["access_token"])
+    return AvitoService(
+        user_id=account.user_id, token=token_data["access_token"]
+    )
 
 
 async def _decide_and_apply(
@@ -456,7 +501,7 @@ async def _decide_and_apply(
             iter_stats.auth_403 += 1
         elif log_message == LOG_SUCCESS:
             iter_stats.set_bid_ok += 1
-        else:  # LOG_BID_CHANGE_FAILED и пр.
+        else:  # LOG_SET_BID_FAILED и пр.
             iter_stats.set_bid_rejected += 1
     elif decision.action == Action.REMOVE:
         if log_message == LOG_DISABLED_BY_AUTH_FAILED:
@@ -491,6 +536,40 @@ async def _bulk_set_log(
         if ctx.promotion.log_message != log_message:
             updates.append((ctx.promotion.id, log_message))
     await database.bulk_update_log_message(updates)
+
+
+async def _bulk_record_disable_notes(
+    database: Database,
+    contexts: list[PromotionContext],
+    log_message: str,
+    now: datetime,
+) -> None:
+    """Маркер на графике при account-wide переходе active → soft-disabled.
+
+    Зеркальная связка к `decision_engine._system_note_text`: когда
+    весь аккаунт уходит в soft-disable (`advance_balance <= 0` и т.п.),
+    decision_engine не запускается, поэтому штатный механизм заметок
+    из `apply_decision` не сработает — записываем заметки здесь, по тем
+    же правилам дедупликации (только если предыдущий `log_message` НЕ
+    был в `SOFT_DISABLED_LOGS`).
+    """
+    if log_message not in SOFT_DISABLED_LOGS:
+        return
+    for ctx in contexts:
+        if ctx.promotion.log_message in SOFT_DISABLED_LOGS:
+            continue
+        try:
+            await database.insert_system_note(
+                promotion_id=ctx.promotion.id,
+                text=log_message,
+                created_at=now,
+            )
+        except Exception:
+            logger.exception(
+                "account-wide insert_system_note сбой promotion={} text={}",
+                ctx.promotion.id,
+                log_message,
+            )
 
 
 async def _sleep_or_stop(

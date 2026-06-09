@@ -4,7 +4,7 @@
 Caller (apply_decision) выполняет сетевые вызовы и записи в БД.
 
 Stages (порядок ранних выходов, повторён в коде compute_target_state):
-1. ad.status != active                    → NOOP   LOG_USER_DELETED
+1. ad.status != active                    → NOOP   LOG_AD_NOT_ACTIVE
 2. promotion.bid IS NULL                  → NOOP   LOG_NOT_CONFIGURED
 3. profile / limit / overuse / end_date   → NOOP   LOG_DISABLED_BY_TARIFF
 4. critical_* в БД отсутствуют            → FETCH_BIDS
@@ -42,6 +42,7 @@ from app.dispatcher.critical_bids import (
     pick_compare_percent,
 )
 from app.log_messages import (
+    LOG_AD_NOT_ACTIVE,
     LOG_BID_ABOVE_MAX_PREFIX,
     LOG_BID_BELOW_MIN,
     LOG_DISABLED_BY_BUDGET,
@@ -55,7 +56,6 @@ from app.log_messages import (
     LOG_NOT_CONFIGURED,
     LOG_PROMOTION_UNAVAILABLE,
     LOG_SUCCESS,
-    LOG_USER_DELETED,
     SOFT_DISABLED_LOGS,
 )
 
@@ -194,17 +194,18 @@ def _system_note_text(
 
     Семантика: маркер на графике ставится в момент перехода active →
     soft-disabled (объявление только что попало в одно из «мягких»
-    отключений: время / бюджет / показы / просмотры / контакты / CPV /
-    CPC / promotion unavailable). Переходы внутри soft-пула (TIME →
-    BUDGET и т.п.) не порождают новой заметки — на графике будет один
-    маркер «уехали в soft-disabled», текст соответствует первой причине.
-    Возврат active → soft происходит само через apply_decision (там
-    log_message не SOFT, return None отсюда).
+    отключений: время / бюджет / аванс / показы / просмотры / контакты /
+    CPV / CPC). Переходы внутри soft-пула (TIME → BUDGET и т.п.) не
+    порождают новой заметки — на графике будет один маркер «уехали в
+    soft-disabled», текст соответствует первой причине. Возврат active
+    → soft происходит само через apply_decision (там log_message не
+    SOFT, return None отсюда).
 
-    Hard-disable (TARIFF, ACCOUNT_DELETED, TOKEN_EXPIRED, AUTH_FAILED,
-    BID_CHANGE_FAILED, BID_BELOW_MIN, BID_ABOVE_MAX_PREFIX) — заметку
-    НЕ пишем. Они отображаются как текущий статус в
-    `ManualPromotion.log_message`, маркер на графике добавлять не нужно.
+    Hard-disable (AD_NOT_ACTIVE, NOT_CONFIGURED, TARIFF, ACCOUNT_DELETED,
+    TOKEN_EXPIRED, AUTH_FAILED, SET_BID_FAILED, BID_BELOW_MIN,
+    BID_ABOVE_MAX_PREFIX, PROMOTION_UNAVAILABLE) — заметку НЕ пишем. Они
+    отображаются как текущий статус в `ManualPromotion.log_message`,
+    маркер на графике добавлять не нужно.
     """
     if log_message not in SOFT_DISABLED_LOGS:
         return None
@@ -226,9 +227,9 @@ def _early_validation(
     if ctx.ad.status != "active":
         return Decision(
             action=Action.NOOP,
-            log_message=LOG_USER_DELETED,
+            log_message=LOG_AD_NOT_ACTIVE,
             write_system_note=_system_note_text(
-                LOG_USER_DELETED, inp.ctx.promotion.log_message
+                LOG_AD_NOT_ACTIVE, inp.ctx.promotion.log_message
             ),
         )
     # 2. not configured (bid обязателен; daily_budget — опционален)

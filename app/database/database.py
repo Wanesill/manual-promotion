@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.database.models import (
     Account,
+    AccountStateHistory,
     Ad,
     AdDetailStatistic,
     ManualPromotion,
@@ -219,6 +220,31 @@ class Database:
                 "restSpending": int(row.rest_spending or 0),
             }
         return result
+
+    async def load_account_advance_balance(
+        self, account_id: int
+    ) -> float | None:
+        """Последний `advance_balance` аккаунта из `account_state_history`.
+
+        Снимки баланса заводит родительский сервис (отдельный синхронизатор),
+        мы только читаем самую свежую запись по индексу
+        `(account_id, timestamp DESC)`.
+
+        Возвращает:
+        - `float` — значение `advance_balance` из последней записи;
+        - `None` — если записей нет ИЛИ `advance_balance is NULL` (источник
+          не успел заполниться). Caller интерпретирует None как «неизвестно»
+          и НЕ блокирует продвижение — поведение зеркалит bidder.
+        """
+        stmt = (
+            select(AccountStateHistory.advance_balance)
+            .where(AccountStateHistory.account_id == account_id)
+            .order_by(AccountStateHistory.timestamp.desc())
+            .limit(1)
+        )
+        async with self._sessionmaker() as session:
+            value = (await session.execute(stmt)).scalar_one_or_none()
+        return value
 
     # ---------- запись ----------
 

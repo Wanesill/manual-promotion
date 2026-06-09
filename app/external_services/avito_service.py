@@ -295,7 +295,7 @@ class AvitoService:
         Возвращает:
         - True  — успешно (HTTP 2xx)
         - None  — HTTP 400 (Avito отверг ставку — пересчитать границы)
-        - False — нерекаверабельная ошибка (caller пишет LOG_BID_CHANGE_FAILED)
+        - False — нерекаверабельная ошибка (caller пишет LOG_SET_BID_FAILED)
         """
         session = await self.get_session()
         payload: dict[str, Any] = {

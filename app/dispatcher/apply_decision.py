@@ -10,8 +10,8 @@ from loguru import logger
 from app.dispatcher.decision_engine import Action, Decision
 from app.external_services.avito_service import AccountForbiddenError
 from app.log_messages import (
-    LOG_BID_CHANGE_FAILED,
     LOG_DISABLED_BY_AUTH_FAILED,
+    LOG_SET_BID_FAILED,
 )
 
 if TYPE_CHECKING:
@@ -79,12 +79,12 @@ async def apply_decision(
             )
             await cache.invalidate_bids(ctx.ad.ad_id)
             await database.reset_critical(ctx.promotion.id)
-            log_message = LOG_BID_CHANGE_FAILED
+            log_message = LOG_SET_BID_FAILED
         else:
             logger.warning(
                 "ad={} SET_BID нерекаверабельная ошибка", ctx.ad.ad_id
             )
-            log_message = LOG_BID_CHANGE_FAILED
+            log_message = LOG_SET_BID_FAILED
 
     elif decision.action == Action.REMOVE:
         try:
@@ -105,7 +105,7 @@ async def apply_decision(
         # не изменилась). Логируем только подтверждённые состояния.
         if (
             decision.action == Action.SET_BID
-            and log_message == LOG_BID_CHANGE_FAILED
+            and log_message == LOG_SET_BID_FAILED
         ):
             pass
         else:
