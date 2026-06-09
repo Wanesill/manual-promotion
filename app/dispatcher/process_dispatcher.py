@@ -162,9 +162,7 @@ async def _supervisor_tick(
     # 2. остановить воркеры неактивных аккаунтов (graceful, между ad'ами)
     for acc_id, worker in workers.items():
         if acc_id not in active_ids and not worker.stop.is_set():
-            logger.info(
-                "account {} больше не активен — останавливаем воркер", acc_id
-            )
+            logger.info("account {} больше не активен — останавливаем воркер", acc_id)
             worker.stop.set()
 
     # 3. поднять воркеры для новых активных аккаунтов
@@ -214,9 +212,7 @@ async def _account_loop(
                 iter_deadline=iter_deadline,
             )
         except Exception:
-            logger.exception(
-                "account {} итерация {} упала", account_id, iteration
-            )
+            logger.exception("account {} итерация {} упала", account_id, iteration)
             done = False
 
         elapsed = time.monotonic() - iter_start
@@ -288,9 +284,7 @@ async def _account_cycle(
             "account {}: status=deleted — выставляем LOG_DISABLED_BY_ACCOUNT_DELETED",
             account_id,
         )
-        await _bulk_set_log(
-            database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED
-        )
+        await _bulk_set_log(database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED)
         return False, None
 
     # 2. Авторизация — inline, без долгоживущего state.
@@ -323,9 +317,7 @@ async def _account_cycle(
             return False, iter_stats
         if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
             try:
-                today_stats = await database.load_today_stats(
-                    account_id=account.id
-                )
+                today_stats = await database.load_today_stats(account_id=account.id)
             except Exception:
                 logger.exception("account {} refresh stats упал", account_id)
             else:
@@ -347,13 +339,8 @@ async def _account_cycle(
             iter_stats.errors += 1
             logger.exception("Сбой обработки promotion={}", ctx.promotion.id)
             continue
-        if (
-            log_message is not None
-            and log_message != ctx.promotion.log_message
-        ):
-            await database.bulk_update_log_message(
-                [(ctx.promotion.id, log_message)]
-            )
+        if log_message is not None and log_message != ctx.promotion.log_message:
+            await database.bulk_update_log_message([(ctx.promotion.id, log_message)])
             ctx.promotion.log_message = log_message
     return False, iter_stats
 
@@ -376,11 +363,6 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
         >= TOKEN_REFRESH_THRESHOLD_S
     )
     if has_db_token:
-        logger.info(
-            "account {}: используем access_token из БД (expires={})",
-            account.user_id,
-            account.expires_in.isoformat() if account.expires_in else "?",
-        )
         return AvitoService(
             user_id=account.user_id,
             token=account.access_token,  # type: ignore[arg-type]
@@ -392,20 +374,6 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
             account.user_id,
         )
         return None
-
-    if account.expires_in is None:
-        logger.info(
-            "account {}: access_token отсутствует в БД — дёргаем authenticate",
-            account.user_id,
-        )
-    else:
-        left_s = int((account.expires_in - datetime.now()).total_seconds())
-        logger.info(
-            "account {}: DB-токен истекает через {}с (порог {}с) — дёргаем authenticate",
-            account.user_id,
-            left_s,
-            TOKEN_REFRESH_THRESHOLD_S,
-        )
 
     try:
         token_data = await AvitoService.authenticate(
@@ -428,14 +396,7 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
         )
         return None
 
-    logger.info(
-        "account {}: authenticate OK, expires_in={}с",
-        account.user_id,
-        int(token_data.get("expires_in", 0)),
-    )
-    return AvitoService(
-        user_id=account.user_id, token=token_data["access_token"]
-    )
+    return AvitoService(user_id=account.user_id, token=token_data["access_token"])
 
 
 async def _decide_and_apply(
