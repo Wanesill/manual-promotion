@@ -53,28 +53,49 @@ async def apply_decision(
                 limit_penny=decision.limit_penny,
             )
         except AccountForbiddenError:
+            logger.warning(
+                "ad={} SET_BID 403 — account {}", ctx.ad.ad_id, avito.user_id
+            )
             log_message = LOG_DISABLED_BY_AUTH_FAILED
             await cache.invalidate_bids(ctx.ad.ad_id)
             return log_message
         if result:
+            logger.info(
+                "ad={} SET_BID OK bid={} limit={}",
+                ctx.ad.ad_id,
+                decision.bid_penny,
+                decision.limit_penny,
+            )
             await cache.invalidate_bids(ctx.ad.ad_id)
         elif result is None:
             # Avito отверг ставку (400) — наши critical_* протухли.
             # Сбрасываем bids-кэш в Redis и обнуляем critical_* в БД,
             # чтобы decision_engine next-итерацией ушёл в FETCH_BIDS
             # и upsert_critical перепишет свежие границы.
+            logger.warning(
+                "ad={} SET_BID 400 — critical_* сброшены, FETCH_BIDS на "
+                "следующей итерации",
+                ctx.ad.ad_id,
+            )
             await cache.invalidate_bids(ctx.ad.ad_id)
             await database.reset_critical(ctx.promotion.id)
             log_message = LOG_BID_CHANGE_FAILED
         else:
+            logger.warning(
+                "ad={} SET_BID нерекаверабельная ошибка", ctx.ad.ad_id
+            )
             log_message = LOG_BID_CHANGE_FAILED
 
     elif decision.action == Action.REMOVE:
         try:
             await avito.remove_cpxpromo(ad_id=ctx.ad.ad_id)
         except AccountForbiddenError:
+            logger.warning(
+                "ad={} REMOVE 403 — account {}", ctx.ad.ad_id, avito.user_id
+            )
             log_message = LOG_DISABLED_BY_AUTH_FAILED
             return log_message
+        logger.info("ad={} REMOVE OK ({})", ctx.ad.ad_id, log_message or "—")
 
     # 3. запись лога (после успешного сетевого вызова или просто snapshot).
     # Эта запись — единственный источник для cooldown (1 ч) и для drift-

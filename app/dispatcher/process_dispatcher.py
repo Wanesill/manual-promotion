@@ -54,6 +54,7 @@ from app.log_messages import (
     LOG_DISABLED_BY_ACCOUNT_DELETED,
     LOG_DISABLED_BY_AUTH_FAILED,
     LOG_DISABLED_BY_TOKEN_EXPIRED,
+    LOG_SUCCESS,
 )
 
 if TYPE_CHECKING:
@@ -93,6 +94,20 @@ AvitoService.authenticate (in-memory only, в БД не пишем)."""
 class _Worker:
     task: asyncio.Task
     stop: asyncio.Event
+
+
+@dataclass
+class _IterStats:
+    """Счётчики одного прохода `_account_cycle`. Логируется в конце итерации."""
+
+    processed: int = 0
+    set_bid_ok: int = 0
+    set_bid_rejected: int = 0  # 400/прочие неуспехи set_manual_bid
+    removed: int = 0
+    noop: int = 0
+    fetch_bids: int = 0
+    auth_403: int = 0
+    errors: int = 0
 
 
 async def run_dispatcher(
@@ -188,8 +203,9 @@ async def _account_loop(
         iteration += 1
         iter_start = time.monotonic()
         iter_deadline = iter_start + MAX_ITERATION_S
+        stats: _IterStats | None = None
         try:
-            done = await _account_cycle(
+            done, stats = await _account_cycle(
                 account_id=account_id,
                 database=database,
                 cache=cache,
@@ -204,13 +220,31 @@ async def _account_loop(
             done = False
 
         elapsed = time.monotonic() - iter_start
-        logger.info(
-            "account {} итерация {} завершена за {:.1f}с (active={})",
-            account_id,
-            iteration,
-            elapsed,
-            not done,
-        )
+        if stats is not None:
+            logger.info(
+                "account {} итерация {} {:.1f}с | processed={} set_bid_ok={} "
+                "set_bid_rejected={} removed={} noop={} fetch_bids={} auth_403={} "
+                "errors={}",
+                account_id,
+                iteration,
+                elapsed,
+                stats.processed,
+                stats.set_bid_ok,
+                stats.set_bid_rejected,
+                stats.removed,
+                stats.noop,
+                stats.fetch_bids,
+                stats.auth_403,
+                stats.errors,
+            )
+        else:
+            logger.info(
+                "account {} итерация {} завершена за {:.1f}с (active={})",
+                account_id,
+                iteration,
+                elapsed,
+                not done,
+            )
         if done:
             return
         wait_for = max(0.0, CYCLE_INTERVAL_S - elapsed)
@@ -225,25 +259,39 @@ async def _account_cycle(
     stop_event: asyncio.Event,
     worker_stop: asyncio.Event,
     iter_deadline: float,
-) -> bool:
-    """Одна итерация цикла. Возвращает True, если воркер должен завершиться.
+) -> tuple[bool, _IterStats | None]:
+    """Одна итерация цикла. Возвращает (done, stats).
 
     `done=True` — у аккаунта не осталось активных promotion'ов
     (load_account_promotions вернул None), supervisor подберёт.
+    `stats` — счётчики прохода для итогового лога. None если до прохода
+    не дошли (deleted/auth_failed).
     `iter_deadline` — `time.monotonic()` после которого прерываем обход на
     границе ad'а (см. MAX_ITERATION_S).
     """
     snapshot = await database.load_account_promotions(account_id)
     if snapshot is None:
-        return True
+        return True, None
     account, contexts, profile_active_count = snapshot
+
+    logger.info(
+        "account {} (user_id={} profile_id={}): {} активных promotion'ов",
+        account_id,
+        account.user_id,
+        account.profile_id,
+        len(contexts),
+    )
 
     # 1. Состояние аккаунта.
     if account.status == "deleted":
+        logger.info(
+            "account {}: status=deleted — выставляем LOG_DISABLED_BY_ACCOUNT_DELETED",
+            account_id,
+        )
         await _bulk_set_log(
             database, contexts, LOG_DISABLED_BY_ACCOUNT_DELETED
         )
-        return False
+        return False, None
 
     # 2. Авторизация — inline, без долгоживущего state.
     avito = await _resolve_avito(account)
@@ -256,30 +304,34 @@ async def _account_cycle(
             else LOG_DISABLED_BY_AUTH_FAILED
         )
         await _bulk_set_log(database, contexts, auth_fail_msg)
-        return False
+        return False, None
 
-    stats = await database.load_today_stats(account_id=account.id)
+    iter_stats = _IterStats()
+    today_stats = await database.load_today_stats(account_id=account.id)
     stats_at = time.monotonic()
     now = datetime.now()
 
     for ctx in contexts:
         if stop_event.is_set() or worker_stop.is_set():
-            return False
+            return False, iter_stats
         if time.monotonic() >= iter_deadline:
             logger.warning(
                 "account {} итерация превысила {}с — прерываем на границе ad'а",
                 account_id,
                 MAX_ITERATION_S,
             )
-            return False
+            return False, iter_stats
         if time.monotonic() - stats_at >= STATS_REFRESH_INTERVAL_S:
             try:
-                stats = await database.load_today_stats(account_id=account.id)
+                today_stats = await database.load_today_stats(
+                    account_id=account.id
+                )
             except Exception:
                 logger.exception("account {} refresh stats упал", account_id)
             else:
                 stats_at = time.monotonic()
                 now = datetime.now()
+        iter_stats.processed += 1
         try:
             log_message = await _decide_and_apply(
                 ctx=ctx,
@@ -287,10 +339,12 @@ async def _account_cycle(
                 avito=avito,
                 cache=cache,
                 database=database,
-                stats_snapshot=stats.get(ctx.ad.ad_id),
+                stats_snapshot=today_stats.get(ctx.ad.ad_id),
                 profile_active_count=profile_active_count,
+                iter_stats=iter_stats,
             )
         except Exception:
+            iter_stats.errors += 1
             logger.exception("Сбой обработки promotion={}", ctx.promotion.id)
             continue
         if (
@@ -301,7 +355,7 @@ async def _account_cycle(
                 [(ctx.promotion.id, log_message)]
             )
             ctx.promotion.log_message = log_message
-    return False
+    return False, iter_stats
 
 
 async def _resolve_avito(account: Account) -> AvitoService | None:
@@ -322,6 +376,11 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
         >= TOKEN_REFRESH_THRESHOLD_S
     )
     if has_db_token:
+        logger.info(
+            "account {}: используем access_token из БД (expires={})",
+            account.user_id,
+            account.expires_in.isoformat() if account.expires_in else "?",
+        )
         return AvitoService(
             user_id=account.user_id,
             token=account.access_token,  # type: ignore[arg-type]
@@ -333,6 +392,20 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
             account.user_id,
         )
         return None
+
+    if account.expires_in is None:
+        logger.info(
+            "account {}: access_token отсутствует в БД — дёргаем authenticate",
+            account.user_id,
+        )
+    else:
+        left_s = int((account.expires_in - datetime.now()).total_seconds())
+        logger.info(
+            "account {}: DB-токен истекает через {}с (порог {}с) — дёргаем authenticate",
+            account.user_id,
+            left_s,
+            TOKEN_REFRESH_THRESHOLD_S,
+        )
 
     try:
         token_data = await AvitoService.authenticate(
@@ -355,6 +428,11 @@ async def _resolve_avito(account: Account) -> AvitoService | None:
         )
         return None
 
+    logger.info(
+        "account {}: authenticate OK, expires_in={}с",
+        account.user_id,
+        int(token_data.get("expires_in", 0)),
+    )
     return AvitoService(
         user_id=account.user_id, token=token_data["access_token"]
     )
@@ -368,8 +446,12 @@ async def _decide_and_apply(
     database: Database,
     stats_snapshot: dict | None,
     profile_active_count: int,
+    iter_stats: _IterStats,
 ) -> str | None:
-    """Один decide → (опц. fetch_bids → recompute) → apply."""
+    """Один decide → (опц. fetch_bids → recompute) → apply.
+
+    Попутно обновляет `iter_stats` (счётчики прохода) для итогового лога.
+    """
     base_input = DecisionInput(
         ctx=ctx,
         now=now,
@@ -380,17 +462,25 @@ async def _decide_and_apply(
     decision: Decision = compute_target_state(base_input)
 
     if decision.action == Action.FETCH_BIDS:
+        iter_stats.fetch_bids += 1
         try:
             bids_info = await _fetch_bids_cached(avito, cache, ctx.ad.ad_id)
         except AccountForbiddenError:
+            iter_stats.auth_403 += 1
             return LOG_DISABLED_BY_AUTH_FAILED
         if bids_info is None:
             from app.log_messages import LOG_PROMOTION_UNAVAILABLE
 
+            logger.debug(
+                "ad={} parse_critical_bids → None (raw={})",
+                ctx.ad.ad_id,
+                str(bids_info)[:200],
+            )
+            iter_stats.noop += 1
             return LOG_PROMOTION_UNAVAILABLE
         decision, _ = recompute_with_bids(base_input, bids_info)
 
-    return await apply_decision(
+    log_message = await apply_decision(
         decision=decision,
         ctx=ctx,
         avito=avito,
@@ -398,6 +488,24 @@ async def _decide_and_apply(
         database=database,
         now=now,
     )
+
+    # Счётчики по фактическому исходу:
+    if decision.action == Action.SET_BID:
+        if log_message == LOG_DISABLED_BY_AUTH_FAILED:
+            iter_stats.auth_403 += 1
+        elif log_message == LOG_SUCCESS:
+            iter_stats.set_bid_ok += 1
+        else:  # LOG_BID_CHANGE_FAILED и пр.
+            iter_stats.set_bid_rejected += 1
+    elif decision.action == Action.REMOVE:
+        if log_message == LOG_DISABLED_BY_AUTH_FAILED:
+            iter_stats.auth_403 += 1
+        else:
+            iter_stats.removed += 1
+    else:
+        iter_stats.noop += 1
+
+    return log_message
 
 
 async def _fetch_bids_cached(
