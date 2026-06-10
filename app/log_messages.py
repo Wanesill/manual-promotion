@@ -1,14 +1,14 @@
 """Русские константы log_message и системных заметок.
 
 Все сообщения end-user-видимые, формат фиксирован — родительский API
-парсит их (в т.ч. по префиксу `LOG_BID_ABOVE_MAX_PREFIX`) для определения
-status_code (success/stopped/error). Не переводить без продуктовой причины.
+сопоставляет их по точному совпадению для определения status_code
+(success/stopped/error). Не переводить без продуктовой причины.
 
 Имена констант синхронизированы с сервисом bidder (бид-менеджер):
 одинаковый триггер → одинаковая константа и одинаковый текст. Исключения,
 специфичные для ручного продвижения: `LOG_NOT_CONFIGURED`,
-`LOG_BID_BELOW_MIN`, `LOG_BID_ABOVE_MAX_PREFIX` — у bidder ставка
-вычисляется автоматически, такого UX не возникает.
+`LOG_BID_BELOW_MIN`, `LOG_BID_ABOVE_MAX` — у bidder ставка вычисляется
+автоматически, такого UX не возникает.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Final
 
 __all__ = [
     "LOG_AD_NOT_ACTIVE",
-    "LOG_BID_ABOVE_MAX_PREFIX",
+    "LOG_BID_ABOVE_MAX",
     "LOG_BID_BELOW_MIN",
     "LOG_DISABLED_BY_ACCOUNT_BALANCE",
     "LOG_DISABLED_BY_ACCOUNT_DELETED",
@@ -54,13 +54,9 @@ LOG_DISABLED_BY_ACCOUNT_BALANCE: Final[str] = "Закончился аванс"
 
 # Ошибки и блокирующие условия.
 LOG_AD_NOT_ACTIVE: Final[str] = "Объявление не активно"
-LOG_NOT_CONFIGURED: Final[str] = "Не настроено ручное продвижение"
-LOG_BID_BELOW_MIN: Final[str] = (
-    "Ставка должна быть больше минимального значения"
-)
-LOG_BID_ABOVE_MAX_PREFIX: Final[str] = (
-    "Ставка должна быть меньше максимального значения"
-)
+LOG_NOT_CONFIGURED: Final[str] = "Не заполнены обязательные настройки"
+LOG_BID_BELOW_MIN: Final[str] = "Ставка должна быть больше минимального значения"
+LOG_BID_ABOVE_MAX: Final[str] = "Ставка должна быть меньше максимального значения"
 LOG_DISABLED_BY_TARIFF: Final[str] = "Тариф закончился"
 LOG_DISABLED_BY_ACCOUNT_DELETED: Final[str] = "Аккаунт удален"
 LOG_DISABLED_BY_TOKEN_EXPIRED: Final[str] = "Токен аккаунта истек"

@@ -13,7 +13,7 @@ Stages (порядок ранних выходов, повторён в коде
 7. spending >= daily_budget (если задан)  → REMOVE LOG_DISABLED_BY_BUDGET
 8-12. метрики                             → REMOVE LOG_DISABLED_BY_*
 13. bid < critical_min_bid                → NOOP   LOG_BID_BELOW_MIN
-14. bid > critical_max_bid                → NOOP   LOG_BID_ABOVE_MAX(...)
+14. bid > critical_max_bid                → NOOP   LOG_BID_ABOVE_MAX
 15. drift && cooldown_ok                  → SET_BID LOG_SUCCESS
 16. drift && !cooldown_ok                 → NOOP
 17. !drift && hourly_log_due              → NOOP write_log=True
@@ -43,7 +43,7 @@ from app.dispatcher.critical_bids import (
 )
 from app.log_messages import (
     LOG_AD_NOT_ACTIVE,
-    LOG_BID_ABOVE_MAX_PREFIX,
+    LOG_BID_ABOVE_MAX,
     LOG_BID_BELOW_MIN,
     LOG_DISABLED_BY_BUDGET,
     LOG_DISABLED_BY_CONTACTS,
@@ -174,9 +174,7 @@ def _round_to_ruble_within_critical(
     return rounded
 
 
-def _clamp_limit(
-    daily_budget: int | None, bounds: CriticalBidsData
-) -> int | None:
+def _clamp_limit(daily_budget: int | None, bounds: CriticalBidsData) -> int | None:
     """Лимит для set_manual_bid: half-up до рубля + clamp в critical."""
     if daily_budget is None:
         return None
@@ -203,7 +201,7 @@ def _system_note_text(
 
     Hard-disable (AD_NOT_ACTIVE, NOT_CONFIGURED, TARIFF, ACCOUNT_DELETED,
     TOKEN_EXPIRED, AUTH_FAILED, SET_BID_FAILED, BID_BELOW_MIN,
-    BID_ABOVE_MAX_PREFIX, PROMOTION_UNAVAILABLE) — заметку НЕ пишем. Они
+    BID_ABOVE_MAX, PROMOTION_UNAVAILABLE) — заметку НЕ пишем. Они
     отображаются как текущий статус в `ManualPromotion.log_message`,
     маркер на графике добавлять не нужно.
     """
@@ -276,10 +274,7 @@ def _disable_by_schedule_or_metrics(
     # ManualPromotion). strftime("%a") даёт русскую аббревиатуру при
     # LC_TIME=ru_RU.UTF-8 — locale выставляется в __main__.setup_logging.
     hour = inp.now.hour
-    if (
-        inp.now.strftime("%a") not in p.work_days
-        or not (p.work_hours_mask >> hour) & 1
-    ):
+    if inp.now.strftime("%a") not in p.work_days or not (p.work_hours_mask >> hour) & 1:
         return _build_disable(inp, bounds, LOG_DISABLED_BY_TIME)
     stats = inp.stats_snapshot or {}
     spending = _spending_penny(stats)
@@ -291,10 +286,7 @@ def _disable_by_schedule_or_metrics(
     if p.daily_budget is not None and spending >= p.daily_budget:
         return _build_disable(inp, bounds, LOG_DISABLED_BY_BUDGET)
     # 9. impressions
-    if (
-        p.disable_impressions_limit
-        and impressions >= p.disable_impressions_limit
-    ):
+    if p.disable_impressions_limit and impressions >= p.disable_impressions_limit:
         return _build_disable(inp, bounds, LOG_DISABLED_BY_IMPRESSIONS)
     # 10. views
     if p.disable_views_limit and views >= p.disable_views_limit:
@@ -335,9 +327,7 @@ def _build_disable(
         compare_percent=compare,
         write_log=write_log,
         log_bid=bounds.disabled_bid,
-        write_system_note=_system_note_text(
-            log_message, inp.ctx.promotion.log_message
-        ),
+        write_system_note=_system_note_text(log_message, inp.ctx.promotion.log_message),
     )
 
 
@@ -397,7 +387,7 @@ def compute_target_state(inp: DecisionInput) -> Decision:
     if bid > bounds.critical_max_bid:
         return Decision(
             action=Action.NOOP,
-            log_message=LOG_BID_ABOVE_MAX_PREFIX,
+            log_message=LOG_BID_ABOVE_MAX,
         )
 
     limit_to_send = _clamp_limit(p.daily_budget, bounds)
@@ -449,9 +439,7 @@ def compute_target_state(inp: DecisionInput) -> Decision:
         compare_percent=compare,
         write_log=hourly_due,
         log_bid=bid,
-        write_system_note=_system_note_text(
-            LOG_SUCCESS, inp.ctx.promotion.log_message
-        ),
+        write_system_note=_system_note_text(LOG_SUCCESS, inp.ctx.promotion.log_message),
     )
 
 
@@ -475,9 +463,7 @@ def recompute_with_bids(
             Decision(
                 action=Action.NOOP,
                 log_message=msg,
-                write_system_note=_system_note_text(
-                    msg, inp.ctx.promotion.log_message
-                ),
+                write_system_note=_system_note_text(msg, inp.ctx.promotion.log_message),
             ),
             None,
         )

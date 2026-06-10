@@ -150,7 +150,7 @@ Key rules:
   fetches bid bounds via Avito API and re-runs `recompute_with_bids`.
 - **`bid` is mandatory.** If outside `critical_min_bid` /
   `critical_max_bid` — NOOP with `LOG_BID_BELOW_MIN` /
-  `LOG_BID_ABOVE_MAX_PREFIX`. We **do not clamp** the bid — that is the
+  `LOG_BID_ABOVE_MAX`. We **do not clamp** the bid — that is the
   signal to the operator that the configured bid violates Avito's bounds.
 - **`daily_budget` is optional.** If `None`, `limitPenny` is not sent to
   `set_manual_bid` and the budget stage (7) is skipped. If set, it goes
@@ -184,9 +184,7 @@ Key rules:
 `LOG_DISABLED_BY_BUDGET`, etc.) end up in user-visible UI rendered by the
 parent service, in `manual_promotion_note.text`, and in PostgreSQL
 `log_message`. **Do not translate them. Do not "improve" the wording.** The
-parent API has parsing code that matches some of them by prefix
-(`LOG_BID_ABOVE_MAX_PREFIX + " ({critical_max_bid//100}₽)"`); structure
-matters.
+parent API matches them by exact string equality; structure matters.
 
 The same goes for log lines that contain bid/limit values for operators —
 keep them Russian.
