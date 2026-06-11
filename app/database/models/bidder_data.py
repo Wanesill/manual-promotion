@@ -37,6 +37,21 @@ class BidderData(Base):
     при выключенном продвижении. Все три заполняются
     исключительно внешним server-side биддером: API
     их не принимает, не валидирует и не отдает наружу.
+
+    Опциональный вторичный набор secondary_account_spend
+    (порог суммарного дневного расхода аккаунта, копейки) +
+    secondary_position_from / secondary_position_to +
+    secondary_min_bid / secondary_max_bid (копейки) задает
+    диапазоны, на которые внешний воркер переключается до
+    конца суток МСК при достижении порога расхода по
+    аккаунту. Все пять полей nullable; API гарантирует
+    "всё или ничего": либо все пять заполнены, либо все
+    пять NULL. Парные инварианты повторяют основные:
+    secondary_position_to <= secondary_position_from,
+    secondary_min_bid < secondary_max_bid. На статус
+    включения биддера эти поля не влияют - фича опциональна.
+    Возврат к основным диапазонам выполняет воркер
+    в начале новых суток МСК. См. ADR BIDDER-022.
     """
 
     account_id: Mapped[int] = mapped_column(
@@ -57,6 +72,21 @@ class BidderData(Base):
     daily_budget: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     min_bid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_bid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    secondary_account_spend: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    secondary_position_from: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    secondary_position_to: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    secondary_min_bid: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    secondary_max_bid: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     step: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     critical_min_bid: Mapped[int | None] = mapped_column(
         Integer, nullable=True
