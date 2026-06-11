@@ -68,9 +68,6 @@ __all__ = [
 ]
 
 COOLDOWN: timedelta = timedelta(hours=1)
-# 5-минутный запас под дрейф тика воркера: иначе snapshot 15:59 → 17:01
-# (последовательная обработка на большом аккаунте пропустила бы час 16:xx).
-HOURLY_LOG_INTERVAL: timedelta = timedelta(minutes=55)
 
 # В Avito API можно слать произвольную кратность, но мы держим внешнюю
 # семантику «всё в целых рублях» — limit/bid округляются до 100 коп.
@@ -110,9 +107,14 @@ class DecisionInput:
 
 
 def _hourly_log_due(last_log_ts: datetime | None, now: datetime) -> bool:
+    """Snapshot пора, если в текущем календарном часе ещё не было записи.
+
+    Привязка к настенным часам, а не к 1h-дельте: иначе при дрейфе тика
+    snapshot 15:59 уезжает до 17:01 и час 16:xx теряется.
+    """
     if last_log_ts is None:
         return True
-    return now - last_log_ts >= HOURLY_LOG_INTERVAL
+    return last_log_ts < now.replace(minute=0, second=0, microsecond=0)
 
 
 def _spending_penny(stats: dict | None) -> int:
