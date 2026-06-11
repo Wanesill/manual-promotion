@@ -68,7 +68,9 @@ __all__ = [
 ]
 
 COOLDOWN: timedelta = timedelta(hours=1)
-HOURLY_LOG_INTERVAL: timedelta = timedelta(hours=1)
+# 5-минутный запас под дрейф тика воркера: иначе snapshot 15:59 → 17:01
+# (последовательная обработка на большом аккаунте пропустила бы час 16:xx).
+HOURLY_LOG_INTERVAL: timedelta = timedelta(minutes=55)
 
 # В Avito API можно слать произвольную кратность, но мы держим внешнюю
 # семантику «всё в целых рублях» — limit/bid округляются до 100 коп.
